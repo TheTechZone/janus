@@ -1,0 +1,21 @@
+database:
+  # Database URL. (required)
+  url: "postgres://postgres@leader_db:5432/postgres"
+logging_config:
+  force_json_output: true
+
+# Aggregation job creator-specific parameters:
+aggregation_job_creation_interval_secs: 5
+
+# Number of sharded database records per batch aggregation. Must not be greater
+# than the equivalent setting in the collection job driver. (required)
+batch_aggregation_shard_count: 32
+
+# Interval on which to check the database for new tasks. (required)
+tasks_update_frequency_secs: 30
+
+# Minimum aggregation job size, in reports. (required)
+min_aggregation_job_size: 10
+
+# Maximum aggregation job size, in reports. (required)
+max_aggregation_job_size: 100
