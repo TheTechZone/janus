@@ -2,10 +2,10 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use derivative::Derivative;
 use janus_aggregator_core::task::{test_util::Task, QueryType};
 #[cfg(feature = "fpvec_bounded_l2")]
-use janus_core::vdaf::{vdaf_dp_strategies, Prio3FixedPointBoundedL2VecSumBitSize};
+use janus_core::vdaf::Prio3FixedPointBoundedL2VecSumBitSize;
 use janus_core::{
-    hpke::{generate_hpke_config_and_private_key, HpkeKeypair},
-    vdaf::VdafInstance,
+    hpke::HpkeKeypair,
+    vdaf::{vdaf_dp_strategies, VdafInstance},
 };
 use janus_messages::{
     query_type::{FixedSize, QueryType as _, TimeInterval},
@@ -150,6 +150,7 @@ impl From<VdafInstance> for VdafObject {
                 bits,
                 length,
                 chunk_length,
+                dp_strategy: _,
             } => VdafObject::Prio3SumVec {
                 bits: NumberAsString(bits),
                 length: NumberAsString(length),
@@ -161,6 +162,7 @@ impl From<VdafInstance> for VdafObject {
                 bits,
                 length,
                 chunk_length,
+                dp_strategy: _,
             } => VdafObject::Prio3SumVecField64MultiproofHmacSha256Aes128 {
                 proofs: NumberAsString(proofs),
                 bits: NumberAsString(bits),
@@ -171,6 +173,7 @@ impl From<VdafInstance> for VdafObject {
             VdafInstance::Prio3Histogram {
                 length,
                 chunk_length,
+                dp_strategy: _,
             } => VdafObject::Prio3Histogram {
                 length: NumberAsString(length),
                 chunk_length: NumberAsString(chunk_length),
@@ -207,6 +210,7 @@ impl From<VdafObject> for VdafInstance {
                 bits: bits.0,
                 length: length.0,
                 chunk_length: chunk_length.0,
+                dp_strategy: vdaf_dp_strategies::Prio3SumVec::NoDifferentialPrivacy,
             },
 
             VdafObject::Prio3SumVecField64MultiproofHmacSha256Aes128 {
@@ -219,6 +223,7 @@ impl From<VdafObject> for VdafInstance {
                 bits: bits.0,
                 length: length.0,
                 chunk_length: chunk_length.0,
+                dp_strategy: vdaf_dp_strategies::Prio3SumVec::NoDifferentialPrivacy,
             },
 
             VdafObject::Prio3Histogram {
@@ -227,6 +232,7 @@ impl From<VdafObject> for VdafInstance {
             } => VdafInstance::Prio3Histogram {
                 length: length.0,
                 chunk_length: chunk_length.0,
+                dp_strategy: vdaf_dp_strategies::Prio3Histogram::NoDifferentialPrivacy,
             },
 
             #[cfg(feature = "fpvec_bounded_l2")]
@@ -379,7 +385,7 @@ impl HpkeConfigRegistry {
             .entry(id)
             .or_insert_with(|| {
                 // Unwrap safety: we always use a supported KEM.
-                generate_hpke_config_and_private_key(
+                HpkeKeypair::generate(
                     id,
                     // These algorithms should be broadly compatible with other DAP implementations, since they
                     // are required by section 6 of draft-ietf-ppm-dap-02.
@@ -556,11 +562,8 @@ impl Default for Keyring {
 
 /// Returns the environment variable RUST_LOG. If it's unset or otherwise invalid, return the
 /// default value of "info".
-pub fn get_rust_log_level() -> (&'static str, String) {
-    (
-        "RUST_LOG",
-        env::var("RUST_LOG").unwrap_or("info".to_string()),
-    )
+pub fn get_rust_log_level() -> String {
+    env::var("RUST_LOG").unwrap_or("info".to_string())
 }
 
 #[cfg(feature = "test-util")]
@@ -687,6 +690,6 @@ pub mod test_util {
     }
 
     pub fn generate_unique_name(prefix: &str) -> String {
-        format!("{}_{}", prefix, hex::encode(random::<[u8; 4]>()))
+        format!("{}-{}", prefix, hex::encode(random::<[u8; 4]>()))
     }
 }

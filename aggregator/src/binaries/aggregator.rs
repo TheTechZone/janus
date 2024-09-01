@@ -1,5 +1,9 @@
 use crate::{
-    aggregator::{self, http_handlers::aggregator_handler},
+    aggregator::{
+        self,
+        http_handlers::aggregator_handler,
+        key_rotator::{deserialize_hpke_key_rotator_config, HpkeKeyRotatorConfig, KeyRotator},
+    },
     binaries::garbage_collector::run_garbage_collector,
     binary_utils::{setup_server, BinaryContext, BinaryOptions, CommonBinaryOptions},
     cache::{
@@ -24,11 +28,10 @@ use serde::{de, Deserialize, Deserializer, Serialize};
 use std::{
     future::{ready, Future},
     path::PathBuf,
-    pin::Pin,
 };
 use std::{iter::Iterator, net::SocketAddr, sync::Arc, time::Duration};
-use tokio::{join, sync::watch};
-use tracing::info;
+use tokio::{spawn, sync::watch, time::interval, try_join};
+use tracing::{error, info};
 use trillium::Handler;
 use trillium_router::router;
 use url::Url;
@@ -66,6 +69,27 @@ async fn run_aggregator(
 
     let datastore = Arc::new(datastore);
 
+    let key_rotator_handle = {
+        let datastore = Arc::clone(&datastore);
+        let config = config.key_rotator.take();
+        let stopper = stopper.clone();
+        spawn(async move {
+            if let Some(config) = config {
+                info!("Running key rotator");
+                let key_rotator = KeyRotator::new(datastore, config.hpke);
+                let mut interval = interval(Duration::from_secs(config.frequency_s));
+                // Note that `interval` fires immediately at first, so the key rotator runs
+                // immediately on boot. This takes care of bootstrapping keys on the first run of
+                // Janus.
+                while stopper.stop_future(interval.tick()).await.is_some() {
+                    if let Err(err) = key_rotator.run().await {
+                        error!(?err, "key rotator error");
+                    }
+                }
+            }
+        })
+    };
+
     let mut handlers = (
         aggregator_handler(
             Arc::clone(&datastore),
@@ -78,19 +102,20 @@ async fn run_aggregator(
         None,
     );
 
-    let garbage_collector_future = {
+    let garbage_collector_handle = {
         let datastore = Arc::clone(&datastore);
         let gc_config = config.garbage_collection.take();
         let meter = meter.clone();
         let stopper = stopper.clone();
-        async move {
+        spawn(async move {
             if let Some(gc_config) = gc_config {
+                info!("Running garbage collector");
                 run_garbage_collector(datastore, gc_config, meter, stopper).await;
             }
-        }
+        })
     };
 
-    let aggregator_api_future: Pin<Box<dyn Future<Output = ()> + Send + 'static>> =
+    let aggregator_api_handle =
         match build_aggregator_api_handler(&options, &config, &datastore, &meter)? {
             Some((handler, config)) => {
                 if let Some(listen_address) = config.listen_address {
@@ -103,7 +128,7 @@ async fn run_aggregator(
 
                     info!(?aggregator_api_bound_address, "Running aggregator API");
 
-                    Box::pin(aggregator_api_server)
+                    spawn(aggregator_api_server)
                 } else if let Some(path_prefix) = &config.path_prefix {
                     // Create a Trillium handler under the requested path prefix, which we'll add to
                     // the DAP API handler in the setup_server call below
@@ -115,12 +140,12 @@ async fn run_aggregator(
                     // Append wildcard so that this handler will match anything under the prefix
                     let path_prefix = format!("{path_prefix}/*");
                     handlers.1 = Some(router().all(path_prefix, handler));
-                    Box::pin(ready(()))
+                    spawn(ready(()))
                 } else {
                     unreachable!("the configuration should not have deserialized to this state")
                 }
             }
-            None => Box::pin(ready(())),
+            None => spawn(ready(())),
         };
 
     let (aggregator_bound_address, aggregator_server) =
@@ -128,14 +153,16 @@ async fn run_aggregator(
             .await
             .context("failed to create aggregator server")?;
     sender.send_replace(Some(aggregator_bound_address));
+    let aggregator_server_handle = spawn(aggregator_server);
 
     info!(?aggregator_bound_address, "Running aggregator");
 
-    join!(
-        aggregator_server,
-        garbage_collector_future,
-        aggregator_api_future
-    );
+    try_join!(
+        aggregator_server_handle,
+        garbage_collector_handle,
+        key_rotator_handle,
+        aggregator_api_handle
+    )?;
     Ok(())
 }
 
@@ -303,6 +330,7 @@ where
 /// let _decoded: Config = serde_yaml::from_str(yaml_config).unwrap();
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(flatten)]
     pub common_config: CommonConfig,
@@ -317,6 +345,10 @@ pub struct Config {
 
     #[serde(default)]
     pub garbage_collection: Option<GarbageCollectorConfig>,
+
+    /// Run the key rotator in this binary.
+    #[serde(default)]
+    pub key_rotator: Option<KeyRotatorConfig>,
 
     /// Address on which this server should listen for connections to the DAP aggregator API and
     /// serve its API endpoints.
@@ -339,9 +371,9 @@ pub struct Config {
     /// the cost of collection.
     pub batch_aggregation_shard_count: u64,
 
-    /// Defines the number of shards to break report counters into. Increasing this value will
-    /// reduce the amount of database contention during report uploads, while increasing the cost
-    /// of getting task metrics.
+    /// Defines the number of shards to break report & aggregation metric counters into. Increasing
+    /// this value will reduce the amount of database contention during report uploads &
+    /// aggregations, while increasing the cost of getting task metrics.
     #[serde(default = "default_task_counter_shard_count")]
     pub task_counter_shard_count: u64,
 
@@ -355,14 +387,30 @@ pub struct Config {
     /// Defines how long to cache tasks for, in seconds. This affects how often the aggregator
     /// becomes aware of task parameter changes. If unspecified, default is defined by
     /// [`TASK_AGGREGATOR_CACHE_DEFAULT_TTL`]. You shouldn't normally have to specify this.
-    #[serde(default)]
-    pub task_cache_ttl_seconds: Option<u64>,
+    // TODO(#3293): remove this alias during next breaking changes window.
+    #[serde(default, alias = "task_cache_ttl_seconds")]
+    pub task_cache_ttl_s: Option<u64>,
 
     /// Defines how many tasks can be cached. This affects how much memory the aggregator might use
     /// to store cached tasks. If unspecified, default is defined by
     /// [`TASK_AGGREGATOR_CACHE_DEFAULT_CAPACITY`]. You shouldn't normally have to specify this.
     #[serde(default)]
     pub task_cache_capacity: Option<u64>,
+
+    /// Experimental. Always advertise global HPKE keys instead of per-task HPKE keys. This will
+    /// become on by default in a future version of Janus.
+    #[serde(default)]
+    pub require_global_hpke_keys: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyRotatorConfig {
+    /// How frequently the key rotator is run, in seconds.
+    pub frequency_s: u64,
+
+    #[serde(deserialize_with = "deserialize_hpke_key_rotator_config")]
+    pub hpke: HpkeKeyRotatorConfig,
 }
 
 fn default_task_counter_shard_count() -> u64 {
@@ -370,6 +418,7 @@ fn default_task_counter_shard_count() -> u64 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GarbageCollectorConfig {
     /// How frequently garbage collection is run, in seconds.
     pub gc_frequency_s: u64,
@@ -419,7 +468,7 @@ impl Config {
                 .as_deref()
                 .map(parse_pem_ec_private_key)
                 .transpose()?,
-            task_cache_ttl: match self.task_cache_ttl_seconds {
+            task_cache_ttl: match self.task_cache_ttl_s {
                 Some(ttl) => Duration::from_secs(ttl),
                 None => TASK_AGGREGATOR_CACHE_DEFAULT_TTL,
             },
@@ -427,6 +476,7 @@ impl Config {
                 .task_cache_capacity
                 .unwrap_or(TASK_AGGREGATOR_CACHE_DEFAULT_CAPACITY),
             log_forbidden_mutations: self.log_forbidden_mutations.clone(),
+            require_global_hpke_keys: self.require_global_hpke_keys,
         })
     }
 }
@@ -460,10 +510,11 @@ pub(crate) fn parse_pem_ec_private_key(ec_private_key_pem: &str) -> Result<Ecdsa
 
 #[cfg(test)]
 mod tests {
-    use super::{AggregatorApi, Config, GarbageCollectorConfig, Options};
+    use super::{AggregatorApi, Config, GarbageCollectorConfig, KeyRotatorConfig, Options};
     use crate::{
         aggregator::{
             self,
+            key_rotator::HpkeKeyRotatorConfig,
             test_util::{hpke_config_signing_key, HPKE_CONFIG_SIGNING_KEY_PEM},
         },
         config::{
@@ -478,16 +529,18 @@ mod tests {
     };
     use assert_matches::assert_matches;
     use clap::CommandFactory;
-    use janus_core::test_util::roundtrip_encoding;
+    use janus_core::{hpke::HpkeCiphersuite, test_util::roundtrip_encoding};
+    use janus_messages::{Duration, HpkeAeadId, HpkeKdfId, HpkeKemId};
     use rand::random;
     use ring::{
         rand::SystemRandom,
         signature::{KeyPair, UnparsedPublicKey, ECDSA_P256_SHA256_ASN1},
     };
     use std::{
+        collections::HashSet,
         net::{IpAddr, Ipv4Addr, SocketAddr},
         path::PathBuf,
-        time::Duration,
+        time::Duration as StdDuration,
     };
 
     #[test]
@@ -518,6 +571,26 @@ mod tests {
                 tasks_per_tx: 15,
                 concurrent_tx_limit: Some(23),
             }),
+            key_rotator: Some(KeyRotatorConfig {
+                frequency_s: random(),
+                hpke: HpkeKeyRotatorConfig {
+                    pending_duration: Duration::from_seconds(random()),
+                    active_duration: Duration::from_seconds(random()),
+                    expired_duration: Duration::from_seconds(random()),
+                    ciphersuites: HashSet::from([
+                        HpkeCiphersuite::new(
+                            HpkeKemId::P256HkdfSha256,
+                            HpkeKdfId::HkdfSha256,
+                            HpkeAeadId::Aes128Gcm,
+                        ),
+                        HpkeCiphersuite::new(
+                            HpkeKemId::P521HkdfSha512,
+                            HpkeKdfId::HkdfSha512,
+                            HpkeAeadId::Aes256Gcm,
+                        ),
+                    ]),
+                },
+            }),
             aggregator_api: Some(aggregator_api),
             common_config: CommonConfig {
                 database: generate_db_config(),
@@ -532,9 +605,10 @@ mod tests {
             task_counter_shard_count: 64,
             taskprov_config: TaskprovConfig::default(),
             global_hpke_configs_refresh_interval: Some(42),
-            task_cache_ttl_seconds: None,
+            task_cache_ttl_s: None,
             task_cache_capacity: None,
             log_forbidden_mutations: Some(PathBuf::from("/tmp/events")),
+            require_global_hpke_keys: true,
         })
     }
 
@@ -546,7 +620,7 @@ mod tests {
     listen_address: "0.0.0.0:8080"
     database:
         url: "postgres://postgres:postgres@localhost:5432/postgres"
-        connection_pool_timeouts_secs: 60
+        connection_pool_timeouts_s: 60
     max_upload_batch_size: 100
     max_upload_batch_write_delay_ms: 250
     batch_aggregation_shard_count: 32
@@ -566,7 +640,7 @@ mod tests {
     listen_address: "0.0.0.0:8080"
     database:
         url: "postgres://postgres:postgres@localhost:5432/postgres"
-        connection_pool_timeouts_secs: 60
+        connection_pool_timeouts_s: 60
     max_upload_batch_size: 100
     max_upload_batch_write_delay_ms: 250
     batch_aggregation_shard_count: 32
@@ -595,7 +669,7 @@ mod tests {
     listen_address: "0.0.0.0:8080"
     database:
         url: "postgres://postgres:postgres@localhost:5432/postgres"
-        connection_pool_timeouts_secs: 60
+        connection_pool_timeouts_s: 60
     max_upload_batch_size: 100
     max_upload_batch_write_delay_ms: 250
     batch_aggregation_shard_count: 32
@@ -629,7 +703,7 @@ mod tests {
     listen_address: "0.0.0.0:8080"
     database:
         url: "postgres://postgres:postgres@localhost:5432/postgres"
-        connection_pool_timeouts_secs: 60
+        connection_pool_timeouts_s: 60
     max_upload_batch_size: 100
     max_upload_batch_write_delay_ms: 250
     batch_aggregation_shard_count: 32
@@ -660,7 +734,7 @@ mod tests {
     health_check_listen_address: "0.0.0.0:8080"
     database:
         url: "postgres://postgres:postgres@localhost:5432/postgres"
-        connection_pool_timeouts_secs: 60
+        connection_pool_timeouts_s: 60
     logging_config:
         tokio_console_config:
             enabled: true
@@ -674,7 +748,7 @@ mod tests {
             .unwrap(),
             &aggregator::Config {
                 max_upload_batch_size: 100,
-                max_upload_batch_write_delay: Duration::from_millis(250),
+                max_upload_batch_write_delay: StdDuration::from_millis(250),
                 batch_aggregation_shard_count: 32,
                 taskprov_config: TaskprovConfig::default(),
                 hpke_config_signing_key: Some(hpke_config_signing_key()),
@@ -691,7 +765,7 @@ mod tests {
     listen_address: "0.0.0.0:8080"
     database:
         url: "postgres://postgres:postgres@localhost:5432/postgres"
-        connection_pool_timeouts_secs: 60
+        connection_pool_timeouts_s: 60
     max_upload_batch_size: 100
     max_upload_batch_write_delay_ms: 250
     batch_aggregation_shard_count: 32
@@ -718,7 +792,7 @@ mod tests {
     listen_address: "0.0.0.0:8080"
     database:
         url: "postgres://postgres:postgres@localhost:5432/postgres"
-        connection_pool_timeouts_secs: 60
+        connection_pool_timeouts_s: 60
     max_upload_batch_size: 100
     max_upload_batch_write_delay_ms: 250
     batch_aggregation_shard_count: 32
@@ -745,7 +819,7 @@ mod tests {
     listen_address: "0.0.0.0:8080"
     database:
         url: "postgres://postgres:postgres@localhost:5432/postgres"
-        connection_pool_timeouts_secs: 60
+        connection_pool_timeouts_s: 60
     max_upload_batch_size: 100
     max_upload_batch_write_delay_ms: 250
     batch_aggregation_shard_count: 32
@@ -767,7 +841,7 @@ mod tests {
     listen_address: "0.0.0.0:8080"
     database:
         url: "postgres://postgres:postgres@localhost:5432/postgres"
-        connection_pool_timeouts_secs: 60
+        connection_pool_timeouts_s: 60
     max_upload_batch_size: 100
     max_upload_batch_write_delay_ms: 250
     batch_aggregation_shard_count: 32
@@ -790,7 +864,7 @@ mod tests {
     health_check_listen_address: "0.0.0.0:8080"
     database:
         url: "postgres://postgres:postgres@localhost:5432/postgres"
-        connection_pool_timeouts_secs: 60
+        connection_pool_timeouts_s: 60
     logging_config:
         tokio_console_config:
             enabled: true
@@ -820,7 +894,7 @@ mod tests {
     health_check_listen_address: "0.0.0.0:8080"
     database:
         url: "postgres://postgres:postgres@localhost:5432/postgres"
-        connection_pool_timeouts_secs: 60
+        connection_pool_timeouts_s: 60
     logging_config:
         tokio_console_config:
             enabled: true
@@ -835,7 +909,7 @@ mod tests {
             .unwrap(),
             &aggregator::Config {
                 max_upload_batch_size: 100,
-                max_upload_batch_write_delay: Duration::from_millis(250),
+                max_upload_batch_write_delay: StdDuration::from_millis(250),
                 batch_aggregation_shard_count: 32,
                 taskprov_config: TaskprovConfig::default(),
                 ..Default::default()
@@ -849,7 +923,7 @@ mod tests {
     health_check_listen_address: "0.0.0.0:8080"
     database:
         url: "postgres://postgres:postgres@localhost:5432/postgres"
-        connection_pool_timeouts_secs: 60
+        connection_pool_timeouts_s: 60
     logging_config:
         open_telemetry_config:
             otlp:
@@ -877,7 +951,7 @@ mod tests {
     health_check_listen_address: "0.0.0.0:8080"
     database:
         url: "postgres://postgres:postgres@localhost:5432/postgres"
-        connection_pool_timeouts_secs: 60
+        connection_pool_timeouts_s: 60
     logging_config:
         open_telemetry_config:
             otlp:
@@ -905,7 +979,7 @@ mod tests {
     health_check_listen_address: "0.0.0.0:8080"
     database:
         url: "postgres://postgres:postgres@localhost:5432/postgres"
-        connection_pool_timeouts_secs: 60
+        connection_pool_timeouts_s: 60
     metrics_config:
         exporter:
             prometheus:
@@ -933,7 +1007,7 @@ mod tests {
     health_check_listen_address: "0.0.0.0:8080"
     database:
         url: "postgres://postgres:postgres@localhost:5432/postgres"
-        connection_pool_timeouts_secs: 60
+        connection_pool_timeouts_s: 60
     metrics_config:
         exporter:
             otlp:

@@ -1,27 +1,27 @@
 use crate::{
     aggregator::{
         http_handlers::{
-            aggregator_handler_with_aggregator,
-            test_util::{setup_http_handler_test, take_problem_details, take_response_body},
+            aggregator_handler, aggregator_handler_with_aggregator,
+            test_util::{take_problem_details, take_response_body, HttpHandlerTest},
             HPKE_CONFIG_SIGNATURE_HEADER,
         },
-        test_util::{hpke_config_signing_key, hpke_config_verification_key},
-        Config,
+        test_util::{
+            default_aggregator_config, hpke_config_signing_key, hpke_config_verification_key,
+        },
+        Aggregator, Config,
     },
     config::TaskprovConfig,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use janus_aggregator_core::{
-    datastore::models::HpkeKeyState,
+    datastore::{models::HpkeKeyState, test_util::ephemeral_datastore},
     task::{test_util::TaskBuilder, QueryType},
     test_util::noop_meter,
 };
 use janus_core::{
-    hpke::{
-        self, test_util::generate_test_hpke_config_and_private_key_with_id, HpkeApplicationInfo,
-        HpkeKeypair, Label,
-    },
-    test_util::runtime::TestRuntime,
+    hpke::{self, HpkeApplicationInfo, HpkeKeypair, Label},
+    test_util::{install_test_trace_subscriber, runtime::TestRuntime},
+    time::MockClock,
     vdaf::VdafInstance,
 };
 use janus_messages::{HpkeConfigList, Role, TaskId};
@@ -33,8 +33,22 @@ use trillium::{KnownHeaderName, Status};
 use trillium_testing::{assert_headers, prelude::get, TestConn};
 
 #[tokio::test]
-async fn hpke_config() {
-    let (_, _ephemeral_datastore, datastore, handler) = setup_http_handler_test().await;
+async fn task_specific_hpke_config() {
+    install_test_trace_subscriber();
+    let clock = MockClock::default();
+    let ephemeral_datastore = ephemeral_datastore().await;
+    let datastore = Arc::new(ephemeral_datastore.datastore(clock.clone()).await);
+    let mut config = default_aggregator_config();
+    config.require_global_hpke_keys = false;
+    let handler = aggregator_handler(
+        datastore.clone(),
+        clock.clone(),
+        TestRuntime::default(),
+        &noop_meter(),
+        config,
+    )
+    .await
+    .unwrap();
 
     let task = TaskBuilder::new(QueryType::TimeInterval, VdafInstance::Prio3Count)
         .build()
@@ -58,7 +72,7 @@ async fn hpke_config() {
     );
 
     // Unknown task ID provided
-    let mut test_conn = get(&format!("/hpke_config?task_id={unknown_task_id}"))
+    let mut test_conn = get(format!("/hpke_config?task_id={unknown_task_id}"))
         .run_async(&handler)
         .await;
     // Expected status and problem type should be per the protocol
@@ -75,7 +89,7 @@ async fn hpke_config() {
     );
 
     // Recognized task ID provided
-    let mut test_conn = get(&format!("/hpke_config?task_id={}", task.id()))
+    let mut test_conn = get(format!("/hpke_config?task_id={}", task.id()))
         .run_async(&handler)
         .await;
 
@@ -95,24 +109,13 @@ async fn hpke_config() {
 
 #[tokio::test]
 async fn global_hpke_config() {
-    let (clock, _ephemeral_datastore, datastore, _) = setup_http_handler_test().await;
-
-    // Insert an HPKE config, i.e. start the application with a keypair already
-    // in the database.
-    let first_hpke_keypair = generate_test_hpke_config_and_private_key_with_id(1);
-    datastore
-        .run_unnamed_tx(|tx| {
-            let keypair = first_hpke_keypair.clone();
-            Box::pin(async move {
-                tx.put_global_hpke_keypair(&keypair).await.unwrap();
-                tx.set_global_hpke_keypair_state(keypair.config().id(), &HpkeKeyState::Active)
-                    .await
-                    .unwrap();
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
+    let HttpHandlerTest {
+        clock,
+        ephemeral_datastore: _ephemeral_datastore,
+        datastore,
+        hpke_keypair: first_hpke_keypair,
+        ..
+    } = HttpHandlerTest::new().await;
 
     let aggregator = Arc::new(
         crate::aggregator::Aggregator::new(
@@ -148,7 +151,8 @@ async fn global_hpke_config() {
     check_hpke_config_is_usable(&hpke_config_list, &first_hpke_keypair);
 
     // Insert an inactive HPKE config.
-    let second_hpke_keypair = generate_test_hpke_config_and_private_key_with_id(2);
+    let first_hpke_keypair_id = u8::from(*first_hpke_keypair.config().id());
+    let second_hpke_keypair = HpkeKeypair::test_with_id(first_hpke_keypair_id.wrapping_add(1));
     datastore
         .run_unnamed_tx(|tx| {
             let keypair = second_hpke_keypair.clone();
@@ -230,25 +234,25 @@ async fn global_hpke_config() {
         .unwrap();
     aggregator.refresh_caches().await.unwrap();
     let test_conn = get("/hpke_config").run_async(&handler).await;
-    assert_eq!(test_conn.status(), Some(Status::BadRequest));
+    assert_eq!(test_conn.status(), Some(Status::InternalServerError));
 }
 
 #[tokio::test]
 async fn global_hpke_config_with_taskprov() {
-    let (clock, _ephemeral_datastore, datastore, _) = setup_http_handler_test().await;
+    let HttpHandlerTest {
+        clock,
+        ephemeral_datastore: _ephemeral_datastore,
+        datastore,
+        ..
+    } = HttpHandlerTest::new().await;
 
-    // Insert an HPKE config, i.e. start the application with a keypair already
-    // in the database.
-    let first_hpke_keypair = generate_test_hpke_config_and_private_key_with_id(1);
-    datastore
+    // Retrieve the global keypair from the test fixture.
+    let first_hpke_keypair = datastore
         .run_unnamed_tx(|tx| {
-            let keypair = first_hpke_keypair.clone();
             Box::pin(async move {
-                tx.put_global_hpke_keypair(&keypair).await.unwrap();
-                tx.set_global_hpke_keypair_state(keypair.config().id(), &HpkeKeyState::Active)
-                    .await
-                    .unwrap();
-                Ok(())
+                Ok(tx.get_global_hpke_keypairs().await.unwrap()[0]
+                    .hpke_keypair()
+                    .clone())
             })
         })
         .await
@@ -286,7 +290,7 @@ async fn global_hpke_config_with_taskprov() {
         .await
         .unwrap();
 
-    let mut test_conn = get(&format!("/hpke_config?task_id={}", task.id()))
+    let mut test_conn = get(format!("/hpke_config?task_id={}", task.id()))
         .run_async(&handler)
         .await;
     assert_eq!(test_conn.status(), Some(Status::Ok));
@@ -323,7 +327,12 @@ fn check_hpke_config_is_usable(hpke_config_list: &HpkeConfigList, hpke_keypair: 
 
 #[tokio::test]
 async fn hpke_config_cors_headers() {
-    let (_, _ephemeral_datastore, datastore, handler) = setup_http_handler_test().await;
+    let HttpHandlerTest {
+        ephemeral_datastore: _ephemeral_datastore,
+        datastore,
+        handler,
+        ..
+    } = HttpHandlerTest::new().await;
 
     let task = TaskBuilder::new(QueryType::TimeInterval, VdafInstance::Prio3Count)
         .build()
@@ -334,7 +343,7 @@ async fn hpke_config_cors_headers() {
     // Check for appropriate CORS headers in response to a preflight request.
     let test_conn = TestConn::build(
         trillium::Method::Options,
-        &format!("/hpke_config?task_id={}", task.id()),
+        format!("/hpke_config?task_id={}", task.id()),
         (),
     )
     .with_request_header(KnownHeaderName::Origin, "https://example.com/")
@@ -350,7 +359,7 @@ async fn hpke_config_cors_headers() {
     );
 
     // Check for appropriate CORS headers with a simple GET request.
-    let test_conn = get(&format!("/hpke_config?task_id={}", task.id()))
+    let test_conn = get(format!("/hpke_config?task_id={}", task.id()))
         .with_request_header(KnownHeaderName::Origin, "https://example.com/")
         .run_async(&handler)
         .await;
@@ -375,4 +384,62 @@ async fn verify_and_decode_hpke_config_list(test_conn: &mut TestConn) -> HpkeCon
         .verify(&response_body, &signature)
         .unwrap();
     HpkeConfigList::get_decoded(&response_body).unwrap()
+}
+
+#[tokio::test]
+async fn require_global_hpke_keys() {
+    let HttpHandlerTest {
+        clock,
+        ephemeral_datastore: _ephemeral_datastore,
+        datastore,
+        ..
+    } = HttpHandlerTest::new().await;
+
+    // Retrieve the global keypair from the test fixture.
+    let keypair = datastore
+        .run_unnamed_tx(|tx| {
+            Box::pin(async move {
+                Ok(tx.get_global_hpke_keypairs().await.unwrap()[0]
+                    .hpke_keypair()
+                    .clone())
+            })
+        })
+        .await
+        .unwrap();
+
+    let cfg = Config {
+        require_global_hpke_keys: true,
+        hpke_config_signing_key: Some(hpke_config_signing_key()),
+        ..Default::default()
+    };
+
+    let aggregator = Arc::new(
+        Aggregator::new(
+            Arc::clone(&datastore),
+            clock.clone(),
+            TestRuntime::default(),
+            &noop_meter(),
+            cfg,
+        )
+        .await
+        .unwrap(),
+    );
+
+    let handler = aggregator_handler_with_aggregator(aggregator.clone(), &noop_meter())
+        .await
+        .unwrap();
+
+    let mut test_conn = get(format!("/hpke_config?task_id={}", &random::<TaskId>()))
+        .run_async(&handler)
+        .await;
+    assert_eq!(test_conn.status(), Some(Status::Ok));
+    let hpke_config_list = verify_and_decode_hpke_config_list(&mut test_conn).await;
+    assert_eq!(hpke_config_list.hpke_configs(), &[keypair.config().clone()]);
+    check_hpke_config_is_usable(&hpke_config_list, &keypair);
+
+    let mut test_conn = get("/hpke_config").run_async(&handler).await;
+    assert_eq!(test_conn.status(), Some(Status::Ok));
+    let hpke_config_list = verify_and_decode_hpke_config_list(&mut test_conn).await;
+    assert_eq!(hpke_config_list.hpke_configs(), &[keypair.config().clone()]);
+    check_hpke_config_is_usable(&hpke_config_list, &keypair);
 }

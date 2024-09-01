@@ -1,12 +1,17 @@
-use crate::aggregator::{
-    aggregate_step_failure_counter,
-    aggregation_job_writer::{
-        AggregationJobWriter, AggregationJobWriterMetrics, UpdateWrite, WritableReportAggregation,
+use crate::{
+    aggregator::{
+        aggregate_step_failure_counter,
+        aggregation_job_writer::{
+            AggregationJobWriter, AggregationJobWriterMetrics, UpdateWrite,
+            WritableReportAggregation,
+        },
+        error::handle_ping_pong_error,
+        http_handlers::AGGREGATION_JOB_ROUTE,
+        query_type::CollectableQueryType,
+        report_aggregation_success_counter, send_request_to_helper, write_task_aggregation_counter,
+        Error, RequestBody,
     },
-    error::handle_ping_pong_error,
-    http_handlers::AGGREGATION_JOB_ROUTE,
-    query_type::CollectableQueryType,
-    report_aggregation_success_counter, send_request_to_helper, Error, RequestBody,
+    metrics::aggregated_report_share_dimension_histogram,
 };
 use anyhow::{anyhow, Result};
 use backoff::backoff::Backoff;
@@ -24,7 +29,11 @@ use janus_aggregator_core::{
     },
     task::{self, AggregatorTask, VerifyKey},
 };
-use janus_core::{retries::is_retryable_http_status, time::Clock, vdaf_dispatch};
+use janus_core::{
+    retries::{is_retryable_http_client_error, is_retryable_http_status},
+    time::Clock,
+    vdaf_dispatch,
+};
 use janus_messages::{
     query_type::{FixedSize, TimeInterval},
     AggregationJobContinueReq, AggregationJobInitializeReq, AggregationJobResp,
@@ -32,7 +41,7 @@ use janus_messages::{
     ReportShare, Role,
 };
 use opentelemetry::{
-    metrics::{Counter, Histogram, Meter, Unit},
+    metrics::{Counter, Histogram, Meter},
     KeyValue,
 };
 use prio::{
@@ -54,6 +63,7 @@ mod tests;
 pub struct AggregationJobDriver<B> {
     // Configuration.
     batch_aggregation_shard_count: u64,
+    task_counter_shard_count: u64,
 
     // Dependencies.
     http_client: reqwest::Client,
@@ -63,6 +73,8 @@ pub struct AggregationJobDriver<B> {
     aggregation_success_counter: Counter<u64>,
     #[derivative(Debug = "ignore")]
     aggregate_step_failure_counter: Counter<u64>,
+    #[derivative(Debug = "ignore")]
+    aggregated_report_share_dimension_histogram: Histogram<u64>,
     #[derivative(Debug = "ignore")]
     job_cancel_counter: Counter<u64>,
     #[derivative(Debug = "ignore")]
@@ -80,21 +92,24 @@ where
         backoff: B,
         meter: &Meter,
         batch_aggregation_shard_count: u64,
+        task_counter_shard_count: u64,
     ) -> Self {
         let aggregation_success_counter = report_aggregation_success_counter(meter);
         let aggregate_step_failure_counter = aggregate_step_failure_counter(meter);
+        let aggregated_report_share_dimension_histogram =
+            aggregated_report_share_dimension_histogram(meter);
 
         let job_cancel_counter = meter
             .u64_counter("janus_job_cancellations")
             .with_description("Count of cancelled jobs.")
-            .with_unit(Unit::new("{job}"))
+            .with_unit("{job}")
             .init();
         job_cancel_counter.add(0, &[]);
 
         let job_retry_counter = meter
             .u64_counter("janus_job_retries")
             .with_description("Count of retried job steps.")
-            .with_unit(Unit::new("{step}"))
+            .with_unit("{step}")
             .init();
         job_retry_counter.add(0, &[]);
 
@@ -103,15 +118,17 @@ where
             .with_description(
                 "The amount of time elapsed while making an HTTP request to a helper.",
             )
-            .with_unit(Unit::new("s"))
+            .with_unit("s")
             .init();
 
         Self {
             batch_aggregation_shard_count,
+            task_counter_shard_count,
             http_client,
             backoff,
             aggregation_success_counter,
             aggregate_step_failure_counter,
+            aggregated_report_share_dimension_histogram,
             job_cancel_counter,
             job_retry_counter,
             http_request_duration_histogram,
@@ -234,7 +251,7 @@ where
             // Only saw report aggregations in state "start" (or failed or invalid).
             (true, false, false) => {
                 self.step_aggregation_job_aggregate_init(
-                    &datastore,
+                    Arc::clone(&datastore),
                     vdaf,
                     lease,
                     task,
@@ -248,7 +265,7 @@ where
             // Only saw report aggregations in state "waiting" (or failed or invalid).
             (false, true, false) => {
                 self.step_aggregation_job_aggregate_continue(
-                    &datastore,
+                    Arc::clone(&datastore),
                     vdaf,
                     lease,
                     task,
@@ -273,7 +290,7 @@ where
         A: vdaf::Aggregator<SEED_SIZE, 16> + Send + Sync + 'static,
     >(
         &self,
-        datastore: &Datastore<C>,
+        datastore: Arc<Datastore<C>>,
         vdaf: Arc<A>,
         lease: Arc<Lease<AcquiredAggregationJob>>,
         task: Arc<AggregatorTask>,
@@ -519,10 +536,7 @@ where
             AggregationJobResp::new(Vec::new())
         };
 
-        // TODO: Use Arc::unwrap_or_clone() once the MSRV is at least 1.76.0.
-        let aggregation_job =
-            Arc::try_unwrap(aggregation_job).unwrap_or_else(|arc| arc.as_ref().clone());
-
+        let aggregation_job = Arc::unwrap_or_clone(aggregation_job);
         self.process_response_from_helper(
             datastore,
             vdaf,
@@ -543,7 +557,7 @@ where
         A: vdaf::Aggregator<SEED_SIZE, 16> + Send + Sync + 'static,
     >(
         &self,
-        datastore: &Datastore<C>,
+        datastore: Arc<Datastore<C>>,
         vdaf: Arc<A>,
         lease: Arc<Lease<AcquiredAggregationJob>>,
         task: Arc<AggregatorTask>,
@@ -727,7 +741,7 @@ where
         A: vdaf::Aggregator<SEED_SIZE, 16> + Send + Sync + 'static,
     >(
         &self,
-        datastore: &Datastore<C>,
+        datastore: Arc<Datastore<C>>,
         vdaf: Arc<A>,
         lease: Arc<Lease<AcquiredAggregationJob>>,
         task: Arc<AggregatorTask>,
@@ -902,11 +916,8 @@ where
             expected_report_aggregation_count
         );
 
-        // TODO: Use Arc::unwrap_or_clone() once the MSRV is at least 1.76.0.
-        let aggregation_job =
-            Arc::try_unwrap(aggregation_job).unwrap_or_else(|arc| arc.as_ref().clone());
-
         // Write everything back to storage.
+        let aggregation_job = Arc::unwrap_or_clone(aggregation_job);
         let mut aggregation_job_writer =
             AggregationJobWriter::<SEED_SIZE, _, _, UpdateWrite, _>::new(
                 Arc::clone(&task),
@@ -914,6 +925,9 @@ where
                 Some(AggregationJobWriterMetrics {
                     report_aggregation_success_counter: self.aggregation_success_counter.clone(),
                     aggregate_step_failure_counter: self.aggregate_step_failure_counter.clone(),
+                    aggregated_report_share_dimension_histogram: self
+                        .aggregated_report_share_dimension_histogram
+                        .clone(),
                 }),
             );
         let new_step = aggregation_job.step().increment();
@@ -923,21 +937,29 @@ where
         )?;
         let aggregation_job_writer = Arc::new(aggregation_job_writer);
 
-        datastore
+        let counters = datastore
             .run_tx("step_aggregation_job_2", |tx| {
                 let vdaf = Arc::clone(&vdaf);
                 let aggregation_job_writer = Arc::clone(&aggregation_job_writer);
                 let lease = Arc::clone(&lease);
 
                 Box::pin(async move {
-                    try_join!(
+                    let ((_, counters), _) = try_join!(
                         aggregation_job_writer.write(tx, Arc::clone(&vdaf)),
                         tx.release_aggregation_job(&lease),
                     )?;
-                    Ok(())
+                    Ok(counters)
                 })
             })
             .await?;
+
+        write_task_aggregation_counter(
+            datastore,
+            self.task_counter_shard_count,
+            *task.id(),
+            counters,
+        );
+
         Ok(())
     }
 
@@ -1181,6 +1203,7 @@ where
             Error::Http(http_error_response) => {
                 is_retryable_http_status(http_error_response.status())
             }
+            Error::HttpClient(error) => is_retryable_http_client_error(error),
             Error::Datastore(error) => match error {
                 datastore::Error::Db(_) | datastore::Error::Pool(_) => true,
                 datastore::Error::User(error) => match error.downcast_ref::<Error>() {

@@ -1,13 +1,13 @@
 use crate::{
     binary_utils::{database_pool, datastore, initialize_rustls, read_config, CommonBinaryOptions},
     config::{BinaryConfig, CommonConfig},
-    git_revision,
     metrics::{install_metrics_exporter, MetricsExporterHandle},
     trace::{install_trace_subscriber, TraceGuards},
 };
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use clap::Parser;
+use janus_aggregator_api::git_revision;
 use janus_aggregator_core::{
     datastore::{self, models::HpkeKeyState, Datastore},
     task::{AggregatorTask, SerializedAggregatorTask},
@@ -16,7 +16,7 @@ use janus_aggregator_core::{
 use janus_core::{
     auth_tokens::AuthenticationToken,
     cli::{AeadAlgorithm, KdfAlgorithm, KemAlgorithm},
-    hpke::generate_hpke_config_and_private_key,
+    hpke::HpkeKeypair,
     time::{Clock, RealClock},
 };
 use janus_messages::{
@@ -59,7 +59,7 @@ pub fn run(command_line_options: CommandLineOptions) -> Result<()> {
             version = env!("CARGO_PKG_VERSION"),
             git_revision = git_revision(),
             rust_version = env!("RUSTC_SEMVER"),
-            "Starting up"
+            "Starting janus_cli"
         );
 
         if command_line_options.dry_run {
@@ -355,7 +355,7 @@ async fn generate_global_hpke_key<C: Clock>(
     aead: HpkeAeadId,
     hpke_config_out_file: Option<&Path>,
 ) -> Result<()> {
-    let hpke_keypair = Arc::new(generate_hpke_config_and_private_key(id, kem, kdf, aead)?);
+    let hpke_keypair = Arc::new(HpkeKeypair::generate(id, kem, kdf, aead)?);
 
     if !dry_run {
         datastore
@@ -682,6 +682,7 @@ impl KubernetesSecretOptions {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ConfigFile {
     #[serde(flatten)]
     common_config: CommonConfig,
@@ -756,10 +757,10 @@ mod tests {
     };
     use janus_core::{
         auth_tokens::AuthenticationToken,
-        hpke::generate_hpke_config_and_private_key,
+        hpke::HpkeKeypair,
         test_util::{kubernetes, roundtrip_encoding},
         time::RealClock,
-        vdaf::VdafInstance,
+        vdaf::{vdaf_dp_strategies, VdafInstance},
     };
     use janus_messages::{
         codec::Encode, Duration, HpkeAeadId, HpkeConfig, HpkeConfigId, HpkeKdfId, HpkeKemId, Role,
@@ -964,7 +965,7 @@ mod tests {
         ds.run_unnamed_tx(|tx| {
             Box::pin(async move {
                 tx.put_global_hpke_keypair(
-                    &generate_hpke_config_and_private_key(
+                    &HpkeKeypair::generate(
                         id,
                         HpkeKemId::P256HkdfSha256,
                         HpkeKdfId::HkdfSha256,
@@ -1012,7 +1013,7 @@ mod tests {
         ds.run_unnamed_tx(|tx| {
             Box::pin(async move {
                 tx.put_global_hpke_keypair(
-                    &generate_hpke_config_and_private_key(
+                    &HpkeKeypair::generate(
                         id,
                         HpkeKemId::P256HkdfSha256,
                         HpkeKdfId::HkdfSha256,
@@ -1092,7 +1093,7 @@ mod tests {
         let peer_endpoint = "https://example.com".try_into().unwrap();
         let role = Role::Leader;
         let verify_key_init = random();
-        let collector_hpke_config = generate_hpke_config_and_private_key(
+        let collector_hpke_config = HpkeKeypair::generate(
             HpkeConfigId::from(96),
             HpkeKemId::P256HkdfSha256,
             HpkeKdfId::HkdfSha256,
@@ -1160,7 +1161,7 @@ mod tests {
             &"https://example.com".try_into().unwrap(),
             Role::Leader,
             random(),
-            &generate_hpke_config_and_private_key(
+            &HpkeKeypair::generate(
                 HpkeConfigId::from(96),
                 HpkeKemId::P256HkdfSha256,
                 HpkeKdfId::HkdfSha256,
@@ -1295,6 +1296,7 @@ mod tests {
                 bits: 1,
                 length: 4,
                 chunk_length: 2,
+                dp_strategy: vdaf_dp_strategies::Prio3SumVec::NoDifferentialPrivacy,
             },
         )
         .with_id(*tasks[0].id())
@@ -1348,7 +1350,6 @@ mod tests {
   min_batch_size: 10
   time_precision: 300
   tolerable_clock_skew: 600
-  input_share_aad_public_share_length_prefix: false
   collector_hpke_config:
     id: 23
     kem_id: X25519HkdfSha256
@@ -1373,7 +1374,6 @@ mod tests {
   min_batch_size: 10
   time_precision: 300
   tolerable_clock_skew: 600
-  input_share_aad_public_share_length_prefix: false
   collector_hpke_config:
     id: 23
     kem_id: X25519HkdfSha256
@@ -1383,7 +1383,7 @@ mod tests {
   aggregator_auth_token_hash:
     type: Bearer
     hash: MJOoBO_ysLEuG_lv2C37eEOf1Ngetsr-Ers0ZYj4vdQ
-  collector_auth_token:
+  collector_auth_token_hash:
   hpke_keys: []
 "#;
 

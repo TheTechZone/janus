@@ -1,4 +1,4 @@
-FROM rust:1.78.0-alpine AS chef
+FROM rust:1.80.1-alpine AS chef
 ENV CARGO_INCREMENTAL=0
 RUN apk add --no-cache libc-dev cmake make
 RUN cargo install cargo-chef --version 0.1.60 && \
@@ -40,10 +40,10 @@ ARG GIT_REVISION=unknown
 ENV GIT_REVISION ${GIT_REVISION}
 RUN cargo build --release -p janus_aggregator --features=prometheus,otlp
 
-FROM alpine:3.19.1 AS final
+FROM alpine:3.20.2 AS final
 ARG BINARY=aggregator
 ARG GIT_REVISION=unknown
-LABEL revision ${GIT_REVISION}
+LABEL revision=${GIT_REVISION}
 COPY --from=builder /src/target/release/janus_aggregator /janus_aggregator
 RUN ln -s /janus_aggregator /aggregator && \
     ln -s /janus_aggregator /garbage_collector && \

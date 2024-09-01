@@ -34,7 +34,7 @@ jobs:
       id: default-input-values
       run: |
         DIVVIUP_TS_INTEROP_CONTAINER= ${{ inputs.divviup_ts_interop_container }}
-        echo "divviup_ts_interop_container=${DIVVIUP_TS_INTEROP_CONTAINER:-us-west2-docker.pkg.dev/divviup-artifacts-public/divviup-ts/divviup_ts_interop_client:4e71c8b@sha256:61d1bf4cb731d0637b2c5489c45def0155ac22411c4e97607e6cff67cf135198}" >> $GITHUB_OUTPUT
+        echo "divviup_ts_interop_container=${DIVVIUP_TS_INTEROP_CONTAINER:-us-west2-docker.pkg.dev/divviup-artifacts-public/divviup-ts/divviup_ts_interop_client:e2bd57d@sha256:ea32ec6d1e6522d4282b644e9885aeb30a0a92877f73e27424e9e00844b9a80c}" >> $GITHUB_OUTPUT
     - name: Get OS version
       id: os-version
       run: echo "release=$(lsb_release --release --short)" >> $GITHUB_OUTPUT
@@ -65,6 +65,8 @@ jobs:
       run: cargo build --profile ci --package janus_messages --no-default-features
     - name: Build janus_core
       run: cargo build --profile ci --package janus_core
+    - name: Test janus_client OHTTP
+      run: cargo test --package janus_client --features ohttp
     # Note: keep Build & Test steps consecutive, and match flags other than `--no-run`.
     - name: Build
       run: cargo test --profile ci --locked --all-targets --no-run
@@ -132,9 +134,9 @@ jobs:
     - name: Clippy (all features)
       run: cargo clippy --profile ci --workspace --all-targets --all-features
     - name: Document
-      run: cargo doc --profile ci --workspace
+      run: cargo doc --profile ci --workspace --all-features
     - name: cargo-deny
-      uses: EmbarkStudios/cargo-deny-action@v1.6.3
+      uses: EmbarkStudios/cargo-deny-action@v2.0.1
       with:
         command: check bans licenses sources -A unmatched-organization
 
@@ -151,7 +153,7 @@ jobs:
         driver: docker-container
         use: true
     - name: Build
-      uses: docker/bake-action@v4.5.0
+      uses: docker/bake-action@v5.7.0
       with:
         files: docker-bake.hcl
         workdir: .
@@ -177,7 +179,7 @@ jobs:
         driver: docker-container
         use: true
     - name: Build
-      uses: docker/bake-action@v4.5.0
+      uses: docker/bake-action@v5.7.0
       with:
         files: docker-bake.hcl
         workdir: .
@@ -189,6 +191,6 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: cargo-deny
-      uses: EmbarkStudios/cargo-deny-action@v1.6.3
+      uses: EmbarkStudios/cargo-deny-action@v2.0.1
       with:
         command: check advisories

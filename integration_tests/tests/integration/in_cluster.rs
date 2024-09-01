@@ -1,15 +1,21 @@
 #![cfg(feature = "in-cluster")]
 
 use crate::{
-    common::{build_test_task, submit_measurements_and_verify_aggregate, TestContext},
+    common::{
+        build_test_task, collect_aggregate_result_generic,
+        submit_measurements_and_verify_aggregate, submit_measurements_generic, TestContext,
+    },
     initialize_rustls,
 };
 use chrono::prelude::*;
 use clap::{CommandFactory, FromArgMatches, Parser};
 use divviup_client::{
-    Client, DivviupClient, Histogram, HpkeConfig, NewAggregator, NewSharedAggregator, NewTask, Vdaf,
+    Client, DivviupClient, Histogram, HpkeConfig, NewAggregator, NewSharedAggregator, NewTask,
+    SumVec, Vdaf,
 };
 use janus_aggregator_core::task::{test_util::TaskBuilder, QueryType};
+#[cfg(feature = "ohttp")]
+use janus_client::OhttpConfig;
 use janus_collector::PrivateCollectorCredential;
 use janus_core::{
     auth_tokens::AuthenticationToken,
@@ -19,11 +25,18 @@ use janus_core::{
         kubernetes::{Cluster, PortForward},
     },
     time::DurationExt,
-    vdaf::VdafInstance,
+    vdaf::{vdaf_dp_strategies, VdafInstance},
 };
 use janus_integration_tests::{client::ClientBackend, TaskParameters};
 use janus_messages::{Duration as JanusDuration, TaskId};
-use std::{env, str::FromStr, time::Duration};
+use prio::{
+    dp::{
+        distributions::PureDpDiscreteLaplace, DifferentialPrivacyStrategy, PureDpBudget, Rational,
+    },
+    field::{Field128, FieldElementWithInteger},
+    vdaf::prio3::Prio3,
+};
+use std::{env, iter, str::FromStr, time::Duration};
 use trillium_rustls::RustlsConfig;
 use trillium_tokio::ClientConfig;
 use url::Url;
@@ -406,18 +419,30 @@ impl InClusterJanusPair {
                     bits,
                     length,
                     chunk_length,
-                } => Vdaf::SumVec {
-                    bits: bits.try_into().unwrap(),
-                    length: length.try_into().unwrap(),
-                    chunk_length: Some(chunk_length.try_into().unwrap()),
-                },
+                    dp_strategy,
+                } => {
+                    let dp_strategy =
+                        serde_json::from_value(serde_json::to_value(dp_strategy).unwrap()).unwrap();
+                    Vdaf::SumVec(SumVec::new(
+                        bits.try_into().unwrap(),
+                        length.try_into().unwrap(),
+                        Some(chunk_length.try_into().unwrap()),
+                        dp_strategy,
+                    ))
+                }
                 VdafInstance::Prio3Histogram {
                     length,
                     chunk_length,
-                } => Vdaf::Histogram(Histogram::Length {
-                    length: length.try_into().unwrap(),
-                    chunk_length: Some(chunk_length.try_into().unwrap()),
-                }),
+                    dp_strategy,
+                } => {
+                    let dp_strategy =
+                        serde_json::from_value(serde_json::to_value(dp_strategy).unwrap()).unwrap();
+                    Vdaf::Histogram(Histogram::Length {
+                        length: length.try_into().unwrap(),
+                        chunk_length: Some(chunk_length.try_into().unwrap()),
+                        dp_strategy,
+                    })
+                }
                 other => panic!("unsupported vdaf {other:?}"),
             },
             min_batch_size: task.min_batch_size(),
@@ -499,6 +524,43 @@ async fn in_cluster_count() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg(feature = "ohttp")]
+async fn in_cluster_count_ohttp() {
+    install_test_trace_subscriber();
+    initialize_rustls();
+
+    // Start port forwards and set up task.
+    let mut janus_pair =
+        InClusterJanusPair::new(VdafInstance::Prio3Count, QueryType::TimeInterval).await;
+
+    // Set up the client to use OHTTP. The keys and relay are assumed to be deployed adjacent to the
+    // leader.
+    janus_pair.task_parameters.endpoint_fragments.ohttp_config = Some(OhttpConfig {
+        key_configs: janus_pair
+            .task_parameters
+            .endpoint_fragments
+            .leader_endpoint_for_host(0)
+            .join("ohttp-keys")
+            .unwrap(),
+        relay: janus_pair
+            .task_parameters
+            .endpoint_fragments
+            .leader_endpoint_for_host(0)
+            .join("gateway")
+            .unwrap(),
+    });
+
+    // Run the behavioral test.
+    submit_measurements_and_verify_aggregate(
+        "in_cluster_count_ohttp",
+        &janus_pair.task_parameters,
+        (janus_pair.leader.port(), janus_pair.helper.port()),
+        &ClientBackend::InProcess,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn in_cluster_sum() {
     install_test_trace_subscriber();
     initialize_rustls();
@@ -527,6 +589,7 @@ async fn in_cluster_histogram() {
         VdafInstance::Prio3Histogram {
             length: 4,
             chunk_length: 2,
+            dp_strategy: vdaf_dp_strategies::Prio3Histogram::NoDifferentialPrivacy,
         },
         QueryType::TimeInterval,
     )
@@ -705,18 +768,18 @@ mod rate_limits {
 
         for handle in handles {
             let (retry_after, status) = handle.await.unwrap();
-            // Every request this test send should get rejected due to a missing body if it gets
-            // past the rate limiter.
-            if status == StatusCode::BAD_REQUEST {
-                assert!(retry_after.is_none());
-                acceptable_status_count += 1
-            } else if status == StatusCode::TOO_MANY_REQUESTS {
+            if status == StatusCode::TOO_MANY_REQUESTS {
                 assert_matches!(retry_after, Some(retry_after) => {
                     let retry_after = retry_after.to_str().unwrap().parse::<u64>().unwrap();
                     assert!(retry_after <= test_config.window);
                     last_retry_after = Some(retry_after);
                 });
                 too_many_requests_count += 1
+            // Every request this test send should get rejected due to a missing body if it gets
+            // past the rate limiter.
+            } else if status.is_client_error() {
+                assert!(retry_after.is_none());
+                acceptable_status_count += 1
             } else {
                 panic!("unexpected status {status:?}");
             }
@@ -732,7 +795,7 @@ mod rate_limits {
             ratio > expected_429_rate - 0.05 && ratio <= expected_429_rate + 0.05,
             "ratio: {ratio} expected 429 rate: {expected_429_rate} \
             count of HTTP 429: {too_many_requests_count} \
-            count of HTTP 400: {acceptable_status_count}",
+            count of HTTP 4xx: {acceptable_status_count}",
         );
 
         let last_retry_after = assert_matches!(last_retry_after, Some(l) => l);
@@ -743,7 +806,8 @@ mod rate_limits {
         for url in [first_request_url.clone(), second_request_url.clone()] {
             let method = method.clone();
             let response = client.request(method, url).send().await.unwrap();
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(response.status() != StatusCode::TOO_MANY_REQUESTS);
+            assert!(response.status().is_client_error());
             assert!(response.headers().get("retry-after").is_none());
         }
     }
@@ -853,4 +917,137 @@ mod rate_limits {
         )
         .await
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn in_cluster_histogram_dp_noise() {
+    static TEST_NAME: &str = "in_cluster_histogram_dp_noise";
+    const HISTOGRAM_LENGTH: usize = 100;
+    const CHUNK_LENGTH: usize = 10;
+
+    install_test_trace_subscriber();
+    initialize_rustls();
+
+    // Start port forwards and set up task.
+    let epsilon = Rational::from_unsigned(1u128, 10u128).unwrap();
+    let janus_pair = InClusterJanusPair::new(
+        VdafInstance::Prio3Histogram {
+            length: HISTOGRAM_LENGTH,
+            chunk_length: CHUNK_LENGTH,
+            dp_strategy: vdaf_dp_strategies::Prio3Histogram::PureDpDiscreteLaplace(
+                PureDpDiscreteLaplace::from_budget(PureDpBudget::new(epsilon).unwrap()),
+            ),
+        },
+        QueryType::FixedSize {
+            max_batch_size: Some(110),
+            batch_time_window_size: Some(JanusDuration::from_hours(8).unwrap()),
+        },
+    )
+    .await;
+    let vdaf = Prio3::new_histogram_multithreaded(2, HISTOGRAM_LENGTH, CHUNK_LENGTH).unwrap();
+
+    let total_measurements: usize = janus_pair
+        .task_parameters
+        .min_batch_size
+        .try_into()
+        .unwrap();
+    let measurements = iter::repeat(0).take(total_measurements).collect::<Vec<_>>();
+    let client_implementation = ClientBackend::InProcess
+        .build(
+            TEST_NAME,
+            &janus_pair.task_parameters,
+            (janus_pair.leader.port(), janus_pair.helper.port()),
+            vdaf.clone(),
+        )
+        .await
+        .unwrap();
+    let before_timestamp = submit_measurements_generic(&measurements, &client_implementation).await;
+    let (report_count, aggregate_result) = collect_aggregate_result_generic(
+        &janus_pair.task_parameters,
+        janus_pair.leader.port(),
+        vdaf,
+        before_timestamp,
+        &(),
+    )
+    .await;
+    assert_eq!(report_count, janus_pair.task_parameters.min_batch_size);
+
+    let mut un_noised_result = [0u128; HISTOGRAM_LENGTH];
+    un_noised_result[0] = report_count.into();
+    // Smoke test: Just confirm that some noise was added. Since epsilon is small, the noise will be
+    // large (drawn from Laplace_Z(20) + Laplace_Z(20)), and it is highly unlikely that all 100
+    // noise values will be zero simultaneously.
+    assert_ne!(aggregate_result, un_noised_result);
+
+    assert!(aggregate_result
+        .iter()
+        .all(|x| *x < Field128::modulus() / 4 || *x > Field128::modulus() / 4 * 3));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn in_cluster_sumvec_dp_noise() {
+    static TEST_NAME: &str = "in_cluster_sumvec_dp_noise";
+    const VECTOR_LENGTH: usize = 50;
+    const BITS: usize = 2;
+    const CHUNK_LENGTH: usize = 10;
+
+    install_test_trace_subscriber();
+    initialize_rustls();
+
+    // Start port forwards and set up task.
+    let epsilon = Rational::from_unsigned(1u128, 10u128).unwrap();
+    let janus_pair = InClusterJanusPair::new(
+        VdafInstance::Prio3SumVec {
+            bits: BITS,
+            length: VECTOR_LENGTH,
+            chunk_length: CHUNK_LENGTH,
+            dp_strategy: vdaf_dp_strategies::Prio3SumVec::PureDpDiscreteLaplace(
+                PureDpDiscreteLaplace::from_budget(PureDpBudget::new(epsilon).unwrap()),
+            ),
+        },
+        QueryType::FixedSize {
+            max_batch_size: Some(110),
+            batch_time_window_size: Some(JanusDuration::from_hours(8).unwrap()),
+        },
+    )
+    .await;
+    let vdaf = Prio3::new_sum_vec_multithreaded(2, BITS, VECTOR_LENGTH, CHUNK_LENGTH).unwrap();
+
+    let total_measurements: usize = janus_pair
+        .task_parameters
+        .min_batch_size
+        .try_into()
+        .unwrap();
+    let measurements = iter::repeat(vec![0; VECTOR_LENGTH])
+        .take(total_measurements)
+        .collect::<Vec<_>>();
+    let client_implementation = ClientBackend::InProcess
+        .build(
+            TEST_NAME,
+            &janus_pair.task_parameters,
+            (janus_pair.leader.port(), janus_pair.helper.port()),
+            vdaf.clone(),
+        )
+        .await
+        .unwrap();
+    let before_timestamp = submit_measurements_generic(&measurements, &client_implementation).await;
+    let (report_count, aggregate_result) = collect_aggregate_result_generic(
+        &janus_pair.task_parameters,
+        janus_pair.leader.port(),
+        vdaf,
+        before_timestamp,
+        &(),
+    )
+    .await;
+    assert_eq!(report_count, janus_pair.task_parameters.min_batch_size);
+
+    let un_noised_result = [0u128; VECTOR_LENGTH];
+    // Smoke test: Just confirm that some noise was added. Since epsilon is small, the noise will be
+    // large (drawn from Laplace_Z(150) + Laplace_Z(150)), and it is highly unlikely that all 50
+    // noise values will be zero simultaneously.
+    assert_ne!(aggregate_result, un_noised_result);
+
+    assert!(aggregate_result
+        .iter()
+        .all(|x| *x < Field128::modulus() / 4 || *x > Field128::modulus() / 4 * 3));
 }

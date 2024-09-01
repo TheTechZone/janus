@@ -5,10 +5,13 @@
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use janus_aggregator::{
+    aggregator::key_rotator::HpkeKeyRotatorConfig,
     binaries::{
         aggregation_job_creator::Config as AggregationJobCreatorConfig,
         aggregation_job_driver::Config as AggregationJobDriverConfig,
-        aggregator::{AggregatorApi, Config as AggregatorConfig, GarbageCollectorConfig},
+        aggregator::{
+            AggregatorApi, Config as AggregatorConfig, GarbageCollectorConfig, KeyRotatorConfig,
+        },
         collection_job_driver::Config as CollectionJobDriverConfig,
         garbage_collector::Config as GarbageCollectorBinaryConfig,
     },
@@ -23,15 +26,20 @@ use janus_aggregator_core::{
     datastore::test_util::ephemeral_datastore,
     task::{test_util::TaskBuilder, QueryType},
 };
-use janus_core::{test_util::install_test_trace_subscriber, time::RealClock, vdaf::VdafInstance};
+use janus_core::{
+    hpke::HpkeCiphersuite, test_util::install_test_trace_subscriber, time::RealClock,
+    vdaf::VdafInstance,
+};
+use janus_messages::{Duration, HpkeAeadId, HpkeKdfId, HpkeKemId};
 use reqwest::Url;
 use serde::Serialize;
 use std::{
+    collections::HashSet,
     future::Future,
     io::{ErrorKind, Write},
     net::{Ipv4Addr, SocketAddr},
     process::{Child, Command, Stdio},
-    time::Instant,
+    time::{Duration as StdDuration, Instant},
 };
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
@@ -63,7 +71,7 @@ async fn wait_for_server(addr: SocketAddr) -> Result<(), Timeout> {
     for _ in 0..30 {
         match TcpStream::connect(addr).await {
             Ok(_) => return Ok(()),
-            Err(_) => sleep(std::time::Duration::from_millis(500)).await,
+            Err(_) => sleep(StdDuration::from_millis(500)).await,
         }
     }
     Err(Timeout)
@@ -129,7 +137,7 @@ async fn graceful_shutdown<C: BinaryConfig + Serialize>(binary_name: &str, mut c
 
     let common_config = config.common_config_mut();
     common_config.database.url = ephemeral_datastore.connection_string().parse().unwrap();
-    common_config.database.connection_pool_timeouts_secs = 60;
+    common_config.database.connection_pool_timeouts_s = 60;
     common_config.health_check_listen_address = health_check_listen_address;
 
     let task = TaskBuilder::new(QueryType::TimeInterval, VdafInstance::Prio3Count)
@@ -215,7 +223,7 @@ async fn graceful_shutdown<C: BinaryConfig + Serialize>(binary_name: &str, mut c
     // Confirm that the binary under test shuts down promptly.
     let start = Instant::now();
     let (mut child, child_exit_status_res) = spawn_blocking(move || {
-        let result = child.wait_timeout(std::time::Duration::from_secs(15));
+        let result = child.wait_timeout(StdDuration::from_secs(15));
         (child, result)
     })
     .await
@@ -254,7 +262,7 @@ async fn aggregator_shutdown() {
         common_config: CommonConfig {
             database: DbConfig {
                 url: "postgres://localhost".parse().unwrap(),
-                connection_pool_timeouts_secs: 60,
+                connection_pool_timeouts_s: 60,
                 connection_pool_max_size: None,
                 check_schema_version: true,
                 tls_trust_store_path: None,
@@ -273,6 +281,26 @@ async fn aggregator_shutdown() {
             tasks_per_tx: 1,
             concurrent_tx_limit: None,
         }),
+        key_rotator: Some(KeyRotatorConfig {
+            frequency_s: 60 * 60 * 6,
+            hpke: HpkeKeyRotatorConfig {
+                pending_duration: Duration::from_seconds(60),
+                active_duration: Duration::from_seconds(60 * 60 * 24),
+                expired_duration: Duration::from_seconds(60 * 60 * 24),
+                ciphersuites: HashSet::from([
+                    HpkeCiphersuite::new(
+                        HpkeKemId::P256HkdfSha256,
+                        HpkeKdfId::HkdfSha256,
+                        HpkeAeadId::Aes128Gcm,
+                    ),
+                    HpkeCiphersuite::new(
+                        HpkeKemId::P521HkdfSha512,
+                        HpkeKdfId::HkdfSha512,
+                        HpkeAeadId::Aes256Gcm,
+                    ),
+                ]),
+            },
+        }),
         listen_address: aggregator_listen_address,
         aggregator_api: Some(AggregatorApi {
             listen_address: Some(aggregator_api_listen_address),
@@ -284,9 +312,10 @@ async fn aggregator_shutdown() {
         batch_aggregation_shard_count: 32,
         task_counter_shard_count: 64,
         global_hpke_configs_refresh_interval: None,
-        task_cache_ttl_seconds: None,
+        task_cache_ttl_s: None,
         task_cache_capacity: None,
         log_forbidden_mutations: None,
+        require_global_hpke_keys: false,
     };
 
     graceful_shutdown("aggregator", config).await;
@@ -299,7 +328,7 @@ async fn garbage_collector_shutdown() {
         common_config: CommonConfig {
             database: DbConfig {
                 url: "postgres://localhost".parse().unwrap(),
-                connection_pool_timeouts_secs: 60,
+                connection_pool_timeouts_s: 60,
                 connection_pool_max_size: None,
                 check_schema_version: true,
                 tls_trust_store_path: None,
@@ -329,7 +358,7 @@ async fn aggregation_job_creator_shutdown() {
         common_config: CommonConfig {
             database: DbConfig {
                 url: "postgres://localhost".parse().unwrap(),
-                connection_pool_timeouts_secs: 60,
+                connection_pool_timeouts_s: 60,
                 connection_pool_max_size: None,
                 check_schema_version: true,
                 tls_trust_store_path: None,
@@ -340,8 +369,8 @@ async fn aggregation_job_creator_shutdown() {
             max_transaction_retries: default_max_transaction_retries(),
         },
         batch_aggregation_shard_count: 32,
-        tasks_update_frequency_secs: 3600,
-        aggregation_job_creation_interval_secs: 60,
+        tasks_update_frequency_s: 3600,
+        aggregation_job_creation_interval_s: 60,
         min_aggregation_job_size: 100,
         max_aggregation_job_size: 100,
         aggregation_job_creation_report_window: 5000,
@@ -357,7 +386,7 @@ async fn aggregation_job_driver_shutdown() {
         common_config: CommonConfig {
             database: DbConfig {
                 url: "postgres://localhost".parse().unwrap(),
-                connection_pool_timeouts_secs: 60,
+                connection_pool_timeouts_s: 60,
                 connection_pool_max_size: None,
                 check_schema_version: true,
                 tls_trust_store_path: None,
@@ -368,19 +397,20 @@ async fn aggregation_job_driver_shutdown() {
             max_transaction_retries: default_max_transaction_retries(),
         },
         job_driver_config: JobDriverConfig {
-            job_discovery_interval_secs: 10,
+            job_discovery_interval_s: 10,
             max_concurrent_job_workers: 10,
-            worker_lease_duration_secs: 600,
-            worker_lease_clock_skew_allowance_secs: 60,
+            worker_lease_duration_s: 600,
+            worker_lease_clock_skew_allowance_s: 60,
             maximum_attempts_before_failure: 5,
-            http_request_timeout_secs: 10,
-            http_request_connection_timeout_secs: 30,
-            retry_initial_interval_millis: 1000,
-            retry_max_interval_millis: 30_000,
-            retry_max_elapsed_time_millis: 300_000,
+            http_request_timeout_s: 10,
+            http_request_connection_timeout_s: 30,
+            retry_initial_interval_ms: 1000,
+            retry_max_interval_ms: 30_000,
+            retry_max_elapsed_time_ms: 300_000,
         },
         taskprov_config: TaskprovConfig::default(),
         batch_aggregation_shard_count: 32,
+        task_counter_shard_count: 32,
     };
 
     graceful_shutdown("aggregation_job_driver", config).await;
@@ -393,7 +423,7 @@ async fn collection_job_driver_shutdown() {
         common_config: CommonConfig {
             database: DbConfig {
                 url: "postgres://localhost".parse().unwrap(),
-                connection_pool_timeouts_secs: 60,
+                connection_pool_timeouts_s: 60,
                 connection_pool_max_size: None,
                 check_schema_version: true,
                 tls_trust_store_path: None,
@@ -404,20 +434,20 @@ async fn collection_job_driver_shutdown() {
             max_transaction_retries: default_max_transaction_retries(),
         },
         job_driver_config: JobDriverConfig {
-            job_discovery_interval_secs: 10,
+            job_discovery_interval_s: 10,
             max_concurrent_job_workers: 10,
-            worker_lease_duration_secs: 600,
-            worker_lease_clock_skew_allowance_secs: 60,
+            worker_lease_duration_s: 600,
+            worker_lease_clock_skew_allowance_s: 60,
             maximum_attempts_before_failure: 5,
-            http_request_timeout_secs: 10,
-            http_request_connection_timeout_secs: 30,
-            retry_initial_interval_millis: 1000,
-            retry_max_interval_millis: 30_000,
-            retry_max_elapsed_time_millis: 300_000,
+            http_request_timeout_s: 10,
+            http_request_connection_timeout_s: 30,
+            retry_initial_interval_ms: 1000,
+            retry_max_interval_ms: 30_000,
+            retry_max_elapsed_time_ms: 300_000,
         },
         batch_aggregation_shard_count: 32,
-        min_collection_job_retry_delay_secs: 1,
-        max_collection_job_retry_delay_secs: 1,
+        min_collection_job_retry_delay_s: 1,
+        max_collection_job_retry_delay_s: 1,
         collection_job_retry_delay_exponential_factor: 1.0,
     };
 

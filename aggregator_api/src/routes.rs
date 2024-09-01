@@ -1,9 +1,11 @@
 use crate::{
+    git_revision,
     models::{
-        AggregatorApiConfig, AggregatorRole, DeleteTaskprovPeerAggregatorReq, GetTaskIdsResp,
-        GetTaskUploadMetricsResp, GlobalHpkeConfigResp, PatchGlobalHpkeConfigReq, PatchTaskReq,
-        PostTaskReq, PostTaskprovPeerAggregatorReq, PutGlobalHpkeConfigReq, SupportedVdaf,
-        TaskResp, TaskprovPeerAggregatorResp,
+        AggregatorApiConfig, AggregatorRole, DeleteTaskprovPeerAggregatorReq,
+        GetTaskAggregationMetricsResp, GetTaskIdsResp, GetTaskUploadMetricsResp,
+        GlobalHpkeConfigResp, PatchGlobalHpkeConfigReq, PatchTaskReq, PostTaskReq,
+        PostTaskprovPeerAggregatorReq, PutGlobalHpkeConfigReq, SupportedVdaf, TaskResp,
+        TaskprovPeerAggregatorResp,
     },
     Config, ConnExt, Error,
 };
@@ -14,9 +16,7 @@ use janus_aggregator_core::{
     taskprov::PeerAggregator,
     SecretBytes,
 };
-use janus_core::{
-    auth_tokens::AuthenticationTokenHash, hpke::generate_hpke_config_and_private_key, time::Clock,
-};
+use janus_core::{auth_tokens::AuthenticationTokenHash, hpke::HpkeKeypair, time::Clock};
 use janus_messages::HpkeConfigId;
 use janus_messages::{
     query_type::Code as SupportedQueryType, Duration, HpkeAeadId, HpkeKdfId, HpkeKemId, Role,
@@ -25,7 +25,11 @@ use janus_messages::{
 use querystring::querify;
 use rand::random;
 use ring::digest::{digest, SHA256};
-use std::{str::FromStr, sync::Arc, unreachable};
+use std::{
+    str::FromStr,
+    sync::{Arc, OnceLock},
+    unreachable,
+};
 use trillium::{Conn, Status};
 use trillium_api::{Json, State};
 
@@ -33,6 +37,10 @@ pub(super) async fn get_config(
     _: &mut Conn,
     State(config): State<Arc<Config>>,
 ) -> Json<AggregatorApiConfig> {
+    static VERSION: OnceLock<String> = OnceLock::new();
+    let software_version =
+        VERSION.get_or_init(|| format!("{}-{}", env!("CARGO_PKG_VERSION"), git_revision()));
+
     Json(AggregatorApiConfig {
         protocol: "DAP-09",
         dap_url: config.public_dap_url.clone(),
@@ -47,7 +55,14 @@ pub(super) async fn get_config(
             SupportedQueryType::TimeInterval,
             SupportedQueryType::FixedSize,
         ],
-        features: &["TokenHash", "UploadMetrics", "TimeBucketedFixedSize"],
+        features: &[
+            "TokenHash",
+            "UploadMetrics",
+            "TimeBucketedFixedSize",
+            "PureDpDiscreteLaplace",
+        ],
+        software_name: "Janus",
+        software_version,
     })
 }
 
@@ -168,7 +183,7 @@ pub(super) async fn post_task<C: Clock>(
             Duration::from_seconds(60), // 1 minute,
             // hpke_keys
             // Unwrap safety: we always use a supported KEM.
-            [generate_hpke_config_and_private_key(
+            [HpkeKeypair::generate(
                 random(),
                 HpkeKemId::X25519HkdfSha256,
                 HpkeKdfId::HkdfSha256,
@@ -292,6 +307,20 @@ pub(super) async fn get_task_upload_metrics<C: Clock>(
     )))
 }
 
+pub(super) async fn get_task_aggregation_metrics<C: Clock>(
+    conn: &mut Conn,
+    State(ds): State<Arc<Datastore<C>>>,
+) -> Result<Json<GetTaskAggregationMetricsResp>, Error> {
+    let task_id = conn.task_id_param()?;
+    Ok(Json(GetTaskAggregationMetricsResp(
+        ds.run_tx("get_task_aggregation_metrics", |tx| {
+            Box::pin(async move { tx.get_task_aggregation_counter(&task_id).await })
+        })
+        .await?
+        .ok_or(Error::NotFound)?,
+    )))
+}
+
 pub(super) async fn get_global_hpke_configs<C: Clock>(
     _: &mut Conn,
     State(ds): State<Arc<Datastore<C>>>,
@@ -341,7 +370,7 @@ pub(super) async fn put_global_hpke_config<C: Clock>(
                 Error::Conflict("All possible IDs for global HPKE key have been taken".to_string())
             })?,
     );
-    let keypair = generate_hpke_config_and_private_key(
+    let keypair = HpkeKeypair::generate(
         config_id,
         req.kem_id.unwrap_or(HpkeKemId::X25519HkdfSha256),
         req.kdf_id.unwrap_or(HpkeKdfId::HkdfSha256),

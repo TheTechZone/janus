@@ -15,6 +15,7 @@ use janus_aggregator::{
         collection_job_driver::{
             self, Config as CollectionJobDriverConfig, Options as CollectionJobDriverOptions,
         },
+        key_rotator::{self, Config as KeyRotatorConfig, Options as KeyRotatorOptions},
     },
     binary_utils::{BinaryContext, CommonBinaryOptions},
     config::{
@@ -37,7 +38,7 @@ use janus_interop_binaries::{
 use janus_messages::Role;
 use std::net::{Ipv4Addr, SocketAddr};
 #[cfg(feature = "testcontainer")]
-use testcontainers::{runners::AsyncRunner, RunnableImage};
+use testcontainers::{runners::AsyncRunner, ContainerRequest, ImageExt};
 use trillium_tokio::Stopper;
 
 /// Represents a running Janus test instance in a container.
@@ -60,16 +61,18 @@ impl JanusContainer {
         };
         let container = ContainerLogsDropGuard::new_janus(
             test_name,
-            RunnableImage::from(Aggregator::default())
+            ContainerRequest::from(Aggregator::default())
                 .with_network(network)
-                .with_env_var(get_rust_log_level())
+                .with_env_var("RUST_LOG", get_rust_log_level())
                 .with_container_name(endpoint.host_str().unwrap())
                 .start()
-                .await,
+                .await
+                .unwrap(),
         );
         let port = container
             .get_host_port_ipv4(Aggregator::INTERNAL_SERVING_PORT)
-            .await;
+            .await
+            .unwrap();
 
         // Wait for the container to start listening on its port.
         await_http_server(port).await;
@@ -138,7 +141,7 @@ impl JanusInProcess {
         let common_config = CommonConfig {
             database: DbConfig {
                 url: database_url,
-                connection_pool_timeouts_secs: 60,
+                connection_pool_timeouts_s: 60,
                 connection_pool_max_size: None,
                 check_schema_version: false,
                 tls_trust_store_path: None,
@@ -160,6 +163,7 @@ impl JanusInProcess {
             common_config: common_config.clone(),
             taskprov_config: TaskprovConfig::default(),
             garbage_collection: None,
+            key_rotator: None,
             listen_address: (Ipv4Addr::LOCALHOST, 0).into(),
             aggregator_api: None,
             max_upload_batch_size: 100,
@@ -167,9 +171,10 @@ impl JanusInProcess {
             batch_aggregation_shard_count: 32,
             task_counter_shard_count: 64,
             global_hpke_configs_refresh_interval: None,
-            task_cache_ttl_seconds: None,
+            task_cache_ttl_s: None,
             task_cache_capacity: None,
             log_forbidden_mutations: None,
+            require_global_hpke_keys: true,
         };
         let aggregation_job_creator_options = AggregationJobCreatorOptions {
             common: common_binary_options.clone(),
@@ -177,8 +182,8 @@ impl JanusInProcess {
         let aggregation_job_creator_config = AggregationJobCreatorConfig {
             common_config: common_config.clone(),
             batch_aggregation_shard_count: 32,
-            tasks_update_frequency_secs: 2,
-            aggregation_job_creation_interval_secs: 1,
+            tasks_update_frequency_s: 2,
+            aggregation_job_creation_interval_s: 1,
             min_aggregation_job_size: 1,
             max_aggregation_job_size: 100,
             aggregation_job_creation_report_window: 5000,
@@ -189,41 +194,49 @@ impl JanusInProcess {
         let aggregation_job_driver_config = AggregationJobDriverConfig {
             common_config: common_config.clone(),
             job_driver_config: JobDriverConfig {
-                job_discovery_interval_secs: 1,
+                job_discovery_interval_s: 1,
                 max_concurrent_job_workers: 10,
-                worker_lease_duration_secs: 10,
-                worker_lease_clock_skew_allowance_secs: 1,
+                worker_lease_duration_s: 10,
+                worker_lease_clock_skew_allowance_s: 1,
                 maximum_attempts_before_failure: 3,
-                http_request_timeout_secs: 30,
-                http_request_connection_timeout_secs: 10,
-                retry_initial_interval_millis: 1000,
-                retry_max_interval_millis: 30_000,
-                retry_max_elapsed_time_millis: 300_000,
+                http_request_timeout_s: 30,
+                http_request_connection_timeout_s: 10,
+                retry_initial_interval_ms: 1000,
+                retry_max_interval_ms: 30_000,
+                retry_max_elapsed_time_ms: 300_000,
             },
             taskprov_config: TaskprovConfig::default(),
             batch_aggregation_shard_count: 32,
+            task_counter_shard_count: 32,
         };
         let collection_job_driver_options = CollectionJobDriverOptions {
             common: common_binary_options.clone(),
         };
         let collection_job_driver_config = CollectionJobDriverConfig {
-            common_config,
+            common_config: common_config.clone(),
             job_driver_config: JobDriverConfig {
-                job_discovery_interval_secs: 1,
+                job_discovery_interval_s: 1,
                 max_concurrent_job_workers: 10,
-                worker_lease_duration_secs: 10,
-                worker_lease_clock_skew_allowance_secs: 1,
+                worker_lease_duration_s: 10,
+                worker_lease_clock_skew_allowance_s: 1,
                 maximum_attempts_before_failure: 3,
-                http_request_timeout_secs: 30,
-                http_request_connection_timeout_secs: 10,
-                retry_initial_interval_millis: 1000,
-                retry_max_interval_millis: 30_000,
-                retry_max_elapsed_time_millis: 300_000,
+                http_request_timeout_s: 30,
+                http_request_connection_timeout_s: 10,
+                retry_initial_interval_ms: 1000,
+                retry_max_interval_ms: 30_000,
+                retry_max_elapsed_time_ms: 300_000,
             },
             batch_aggregation_shard_count: 32,
-            min_collection_job_retry_delay_secs: 1,
-            max_collection_job_retry_delay_secs: 1,
+            min_collection_job_retry_delay_s: 1,
+            max_collection_job_retry_delay_s: 1,
             collection_job_retry_delay_exponential_factor: 1.0,
+        };
+        let key_rotator_config = KeyRotatorConfig {
+            common_config,
+            key_rotator: Default::default(),
+        };
+        let key_rotator_options = KeyRotatorOptions {
+            common: common_binary_options,
         };
 
         // Spawn each component.
@@ -271,6 +284,19 @@ impl JanusInProcess {
                 options: collection_job_driver_options,
                 config: collection_job_driver_config,
                 datastore: ephemeral_datastore.datastore(clock).await,
+                meter: noop_meter(),
+                stopper: stopper.clone(),
+            });
+            async {
+                future.await.unwrap();
+            }
+        });
+        tokio::spawn({
+            let future = key_rotator::main_callback(BinaryContext {
+                clock,
+                options: key_rotator_options,
+                config: key_rotator_config,
+                datastore,
                 meter: noop_meter(),
                 stopper: stopper.clone(),
             });

@@ -17,25 +17,37 @@ use sqlx::{
     Connection, PgConnection,
 };
 use std::{
+    env,
     path::PathBuf,
     str::FromStr,
+    sync::mpsc,
     sync::{Arc, Weak},
+    thread::JoinHandle,
     time::Duration,
 };
-use testcontainers::{runners::AsyncRunner, ContainerAsync, RunnableImage};
-use tokio::sync::Mutex;
+use testcontainers::{core::Mount, runners::AsyncRunner, ContainerRequest, ImageExt};
+use tokio::{
+    io::{AsyncBufRead, AsyncBufReadExt},
+    join,
+    sync::{
+        oneshot::{self, Sender},
+        Mutex,
+    },
+};
 use tokio_postgres::{connect, Config, NoTls};
 use tracing::trace;
 
 use super::SUPPORTED_SCHEMA_VERSIONS;
 
-struct EphemeralDatabase {
-    _db_container: ContainerAsync<Postgres>,
+pub struct EphemeralDatabase {
+    db_thread: Option<JoinHandle<()>>,
+    db_thread_shutdown: Option<Sender<()>>,
     port_number: u16,
+    cleanup_tx: mpsc::Sender<String>,
 }
 
 impl EphemeralDatabase {
-    async fn shared() -> Arc<Self> {
+    pub async fn shared() -> Arc<Self> {
         static EPHEMERAL_DATABASE: Mutex<Weak<EphemeralDatabase>> = Mutex::const_new(Weak::new());
 
         let mut g = EPHEMERAL_DATABASE.lock().await;
@@ -49,15 +61,108 @@ impl EphemeralDatabase {
     }
 
     async fn start() -> Self {
-        // Start an instance of Postgres running in a container.
-        let db_container = RunnableImage::from(Postgres::default()).start().await;
-        const POSTGRES_DEFAULT_PORT: u16 = 5432;
-        let port_number = db_container.get_host_port_ipv4(POSTGRES_DEFAULT_PORT).await;
-        trace!("Postgres container is up with port {port_number}");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (port_tx, port_rx) = oneshot::channel();
+
+        // Hack: run testcontainer logic under its own thread with its own tokio runtime, to avoid
+        // deadlocking the main runtime when waiting for logs to finish in the Drop implementation.
+        let db_thread = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    let should_log = env::var_os("JANUS_TEST_DUMP_POSTGRESQL_LOGS").is_some();
+                    let mut configuration = Vec::from(["max_connections=200"]);
+                    if should_log {
+                        configuration.append(&mut Vec::from([
+                            // Enable logging of query plans.
+                            "shared_preload_libraries=auto_explain",
+                            "log_min_messages=LOG",
+                            "auto_explain.log_min_duration=0",
+                            "auto_explain.log_analyze=true",
+                        ]))
+                    }
+
+                    // Start an instance of Postgres running in a container.
+                    let db_container = ContainerRequest::from(Postgres::default())
+                        .with_cmd(Self::postgres_configuration(&configuration))
+                        .with_mount(Mount::tmpfs_mount("/var/lib/postgresql/data"))
+                        .start()
+                        .await
+                        .unwrap();
+
+                    let stdout = db_container.stdout(true);
+                    let stderr = db_container.stderr(true);
+                    let log_consumer_handle = should_log.then(|| {
+                        tokio::spawn(async move {
+                            join!(buffer_printer(stdout), buffer_printer(stderr));
+                        })
+                    });
+
+                    const POSTGRES_DEFAULT_PORT: u16 = 5432;
+                    let port_number = db_container
+                        .get_host_port_ipv4(POSTGRES_DEFAULT_PORT)
+                        .await
+                        .unwrap();
+                    trace!("Postgres container is up with port {port_number}");
+
+                    // Send port information, which frees this function to continue.
+                    port_tx.send(port_number).unwrap();
+
+                    // Wait for shutdown to be signalled.
+                    shutdown_rx.await.unwrap();
+
+                    // Shutdown container and Wait for log consumers to stop.
+                    db_container.stop().await.unwrap();
+                    if let Some(log_consumer_handle) = log_consumer_handle {
+                        log_consumer_handle.await.unwrap();
+                    }
+                })
+        });
+
+        let port_number = port_rx.await.unwrap();
+
+        // Make a best-effort attempt to delete databases created for datastores, once they are no
+        // longer needed. This may fail if the container hosting the database server is deleted
+        // faster, which would make this moot.
+        let (cleanup_tx, cleanup_rx) = mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            let handle = runtime.handle();
+
+            let connection_string =
+                format!("postgres://postgres:postgres@127.0.0.1:{port_number}/postgres");
+
+            while let Ok(name) = cleanup_rx.recv() {
+                let connection_string = connection_string.clone();
+                handle.spawn({
+                    let handle = handle.clone();
+                    async move {
+                        let Ok((client, connection)) =
+                            tokio_postgres::connect(&connection_string, NoTls).await
+                        else {
+                            return;
+                        };
+                        handle.spawn(async move {
+                            let _ = connection.await;
+                        });
+
+                        let _ = client.execute(&format!("DROP DATABASE {name}"), &[]).await;
+                    }
+                });
+            }
+        });
 
         Self {
-            _db_container: db_container,
+            db_thread: Some(db_thread),
+            db_thread_shutdown: Some(shutdown_tx),
             port_number,
+            cleanup_tx,
         }
     }
 
@@ -67,6 +172,31 @@ impl EphemeralDatabase {
             self.port_number
         )
     }
+
+    fn postgres_configuration<'a>(settings: &[&'a str]) -> Vec<&'a str> {
+        settings
+            .iter()
+            .flat_map(|setting| ["-c", setting])
+            .collect::<Vec<_>>()
+    }
+
+    fn drop_database(&self, name: String) {
+        let _ = self.cleanup_tx.send(name);
+    }
+}
+
+async fn buffer_printer(buffer: std::pin::Pin<Box<dyn AsyncBufRead + Send>>) {
+    let mut lines = buffer.lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        println!("{}", line);
+    }
+}
+
+impl Drop for EphemeralDatabase {
+    fn drop(&mut self) {
+        self.db_thread_shutdown.take().map(|tx| tx.send(()));
+        self.db_thread.take().map(|thread| thread.join());
+    }
 }
 
 /// EphemeralDatastore represents an ephemeral datastore instance. It has methods allowing
@@ -74,11 +204,12 @@ impl EphemeralDatabase {
 ///
 /// Dropping the EphemeralDatastore will cause it to be shut down & cleaned up.
 pub struct EphemeralDatastore {
-    _db: Arc<EphemeralDatabase>,
+    db: Arc<EphemeralDatabase>,
     connection_string: String,
     pool: Pool,
     datastore_key_bytes: Vec<u8>,
     migrator: Migrator,
+    db_name: String,
 }
 
 pub const TEST_DATASTORE_MAX_TRANSACTION_RETRIES: u64 = 1000;
@@ -165,6 +296,12 @@ impl EphemeralDatastore {
                 .await
                 .unwrap_or_else(|e| panic!("failed to downgrade to version {}: {}", v, e));
         }
+    }
+}
+
+impl Drop for EphemeralDatastore {
+    fn drop(&mut self) {
+        self.db.drop_database(self.db_name.clone());
     }
 }
 
@@ -292,11 +429,12 @@ impl EphemeralDatastoreBuilder {
             .unwrap();
 
         EphemeralDatastore {
-            _db: db,
+            db,
             connection_string,
             pool,
             datastore_key_bytes: generate_aead_key_bytes(),
             migrator,
+            db_name,
         }
     }
 }

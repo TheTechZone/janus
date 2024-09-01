@@ -4,7 +4,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use janus_client::Client;
 use janus_core::vdaf::{Prio3SumVecField64MultiproofHmacSha256Aes128, VdafInstance};
 use janus_interop_binaries::{get_rust_log_level, ContainerLogsDropGuard};
-use janus_messages::{Duration, TaskId};
+use janus_messages::{Duration, TaskId, Time};
 use prio::{
     codec::Encode,
     field::Field64,
@@ -17,7 +17,11 @@ use prio::{
 use rand::random;
 use serde_json::{json, Value};
 use std::env;
-use testcontainers::{core::WaitFor, runners::AsyncRunner, Image, RunnableImage};
+use testcontainers::{
+    core::{wait::HealthWaitStrategy, WaitFor},
+    runners::AsyncRunner,
+    ContainerRequest, Image, ImageExt,
+};
 use url::Url;
 
 /// Extension trait to encode measurements for VDAFs as JSON objects, according to
@@ -92,6 +96,7 @@ fn json_encode_vdaf(vdaf: &VdafInstance) -> Value {
             bits,
             length,
             chunk_length,
+            dp_strategy: _,
         } => json!({
             "type": "Prio3SumVec",
             "bits": format!("{bits}"),
@@ -103,6 +108,7 @@ fn json_encode_vdaf(vdaf: &VdafInstance) -> Value {
             bits,
             length,
             chunk_length,
+            dp_strategy: _,
         } => json!({
             "type": "Prio3SumVecField64MultiproofHmacSha256Aes128",
             "proofs": format!("{proofs}"),
@@ -113,6 +119,7 @@ fn json_encode_vdaf(vdaf: &VdafInstance) -> Value {
         VdafInstance::Prio3Histogram {
             length,
             chunk_length,
+            dp_strategy: _,
         } => {
             json!({
                 "type": "Prio3Histogram",
@@ -155,8 +162,8 @@ impl InteropClient {
                 name: "us-west2-docker.pkg.dev/divviup-artifacts-public/divviup-ts/\
                        divviup_ts_interop_client"
                     .to_string(),
-                tag: "4e71c8b@sha256:\
-                      61d1bf4cb731d0637b2c5489c45def0155ac22411c4e97607e6cff67cf135198"
+                tag: "e2bd57d@sha256:\
+                      ea32ec6d1e6522d4282b644e9885aeb30a0a92877f73e27424e9e00844b9a80c"
                     .to_string(),
             }
         }
@@ -164,18 +171,16 @@ impl InteropClient {
 }
 
 impl Image for InteropClient {
-    type Args = ();
-
-    fn name(&self) -> String {
-        self.name.clone()
+    fn name(&self) -> &str {
+        &self.name
     }
 
-    fn tag(&self) -> String {
-        self.tag.clone()
+    fn tag(&self) -> &str {
+        &self.tag
     }
 
     fn ready_conditions(&self) -> Vec<testcontainers::core::WaitFor> {
-        Vec::from([WaitFor::Healthcheck])
+        Vec::from([WaitFor::Healthcheck(HealthWaitStrategy::new())])
     }
 }
 
@@ -262,14 +267,19 @@ where
         let (leader_aggregator_endpoint, helper_aggregator_endpoint) = task_parameters
             .endpoint_fragments
             .endpoints_for_host_client(leader_port, helper_port);
-        let client = Client::new(
+        let mut builder = Client::builder(
             task_parameters.task_id,
             leader_aggregator_endpoint,
             helper_aggregator_endpoint,
             task_parameters.time_precision,
             vdaf,
-        )
-        .await?;
+        );
+
+        if let Some(ohttp_config) = &task_parameters.endpoint_fragments.ohttp_config {
+            builder = builder.with_ohttp_config(ohttp_config.clone());
+        }
+
+        let client = builder.build().await?;
         Ok(ClientImplementation::InProcess { client })
     }
 
@@ -284,14 +294,15 @@ where
         let client_container_name = format!("client-{random_part}");
         let container = ContainerLogsDropGuard::new_janus(
             test_name,
-            RunnableImage::from(container_image)
+            ContainerRequest::from(container_image)
                 .with_network(network)
-                .with_env_var(get_rust_log_level())
+                .with_env_var("RUST_LOG", get_rust_log_level())
                 .with_container_name(client_container_name)
                 .start()
-                .await,
+                .await
+                .unwrap(),
         );
-        let host_port = container.get_host_port_ipv4(8080).await;
+        let host_port = container.get_host_port_ipv4(8080).await.unwrap();
         let http_client = reqwest::Client::new();
         let (leader_aggregator_endpoint, helper_aggregator_endpoint) = task_parameters
             .endpoint_fragments
@@ -309,11 +320,12 @@ where
         }))
     }
 
-    pub async fn upload(&self, measurement: &V::Measurement) -> anyhow::Result<()> {
+    pub async fn upload(&self, measurement: &V::Measurement, time: Time) -> anyhow::Result<()> {
         match self {
-            ClientImplementation::InProcess { client } => {
-                client.upload(measurement).await.map_err(Into::into)
-            }
+            ClientImplementation::InProcess { client } => client
+                .upload_with_time(measurement, time)
+                .await
+                .map_err(Into::into),
             ClientImplementation::Container(inner) => {
                 let task_id_encoded = URL_SAFE_NO_PAD.encode(inner.task_id.get_encoded().unwrap());
                 let upload_response = inner
@@ -328,6 +340,7 @@ where
                         "helper": inner.helper,
                         "vdaf": json_encode_vdaf(&inner.vdaf_instance),
                         "measurement": inner.vdaf.json_encode_measurement(measurement),
+                        "time": time.as_seconds_since_epoch(),
                         "time_precision": inner.time_precision.as_seconds(),
                     }))
                     .send()

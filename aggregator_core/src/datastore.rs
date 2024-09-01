@@ -6,7 +6,8 @@ use self::models::{
     BatchAggregationStateCode, CollectionJob, CollectionJobState, CollectionJobStateCode,
     GlobalHpkeKeypair, HpkeKeyState, LeaderStoredReport, Lease, LeaseToken, OutstandingBatch,
     ReportAggregation, ReportAggregationMetadata, ReportAggregationMetadataState,
-    ReportAggregationState, ReportAggregationStateCode, SqlInterval, TaskUploadCounter,
+    ReportAggregationState, ReportAggregationStateCode, SqlInterval, TaskAggregationCounter,
+    TaskUploadCounter,
 };
 #[cfg(feature = "test-util")]
 use crate::VdafHasAggregationParameter;
@@ -31,7 +32,7 @@ use janus_messages::{
     ReportShare, Role, TaskId, Time,
 };
 use opentelemetry::{
-    metrics::{Counter, Histogram, Meter, Unit},
+    metrics::{Counter, Histogram, Meter},
     KeyValue,
 };
 use postgres_types::{FromSql, Json, Timestamp, ToSql};
@@ -102,7 +103,7 @@ macro_rules! supported_schema_versions {
 // version is seen, [`Datastore::new`] fails.
 //
 // Note that the latest supported version must be first in the list.
-supported_schema_versions!(3);
+supported_schema_versions!(7);
 
 /// Datastore represents a datastore for Janus, with support for transactional reads and writes.
 /// In practice, Datastore instances are currently backed by a PostgreSQL database.
@@ -189,7 +190,7 @@ impl<C: Clock> Datastore<C> {
         let transaction_status_counter = meter
             .u64_counter(TRANSACTION_METER_NAME)
             .with_description("Count of database transactions run, with their status.")
-            .with_unit(Unit::new("{transaction}"))
+            .with_unit("{transaction}")
             .init();
         let rollback_error_counter = meter
             .u64_counter(TRANSACTION_ROLLBACK_METER_NAME)
@@ -197,12 +198,12 @@ impl<C: Clock> Datastore<C> {
                 "Count of errors received when rolling back a database transaction, ",
                 "with their PostgreSQL error code.",
             ))
-            .with_unit(Unit::new("{error}"))
+            .with_unit("{error}")
             .init();
         let transaction_retry_histogram = meter
             .u64_histogram(TRANSACTION_RETRIES_METER_NAME)
             .with_description("The number of retries before a transaction is committed or aborted.")
-            .with_unit(Unit::new("{retry}"))
+            .with_unit("{retry}")
             .init();
         let transaction_duration_histogram = meter
             .f64_histogram(TRANSACTION_DURATION_METER_NAME)
@@ -210,7 +211,7 @@ impl<C: Clock> Datastore<C> {
                 "Duration of database transactions. This counts only the time spent between the ",
                 "BEGIN and COMMIT/ROLLBACK statements."
             ))
-            .with_unit(Unit::new("s"))
+            .with_unit("s")
             .init();
         let transaction_pool_wait_histogram = meter
             .f64_histogram(TRANSACTION_POOL_WAIT_METER_NAME)
@@ -218,7 +219,7 @@ impl<C: Clock> Datastore<C> {
                 "Time spent waiting for a transaction to BEGIN, because it is waiting for a ",
                 "slot to become available in the connection pooler."
             ))
-            .with_unit(Unit::new("s"))
+            .with_unit("s")
             .init();
 
         Self {
@@ -403,6 +404,25 @@ impl<C: Clock> Datastore<C> {
             Box::pin(async move { tx.put_aggregator_task(&task).await })
         })
         .await
+    }
+
+    /// Write an arbitrary global HPKE key to the datastore and place it in the
+    /// [`HpkeKeyState::Active`] state.
+    #[cfg(feature = "test-util")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "test-util")))]
+    pub async fn put_global_hpke_key(&self) -> Result<HpkeKeypair, Error> {
+        let keypair = HpkeKeypair::test();
+        self.run_tx("test-put-global-hpke-key", |tx| {
+            let keypair = keypair.clone();
+            Box::pin(async move {
+                tx.put_global_hpke_keypair(&keypair).await?;
+                tx.set_global_hpke_keypair_state(keypair.config().id(), &HpkeKeyState::Active)
+                    .await
+            })
+        })
+        .await?;
+
+        Ok(keypair)
     }
 }
 
@@ -4424,7 +4444,8 @@ ON CONFLICT(task_id, batch_identifier, aggregation_param) DO UPDATE
         // Note that this ignores aggregation parameter, as `outstanding_batches` does not need to
         // worry about aggregation parameters.
         //
-        // TODO(#225): reevaluate whether we can ignore aggregation parameter here once we have experience with VDAFs requiring multiple aggregations per batch.
+        // TODO(#225): reevaluate whether we can ignore aggregation parameter here once we have
+        // experience with VDAFs requiring multiple aggregations per batch.
         let stmt = self
             .prepare_cached(
                 "-- put_outstanding_batch()
@@ -4550,7 +4571,7 @@ WHERE task_id = $1
 
         try_join_all(rows.into_iter().map(|row| async move {
             let batch_id = BatchId::get_decoded(row.get("batch_id"))?;
-            let size = self.read_batch_size(task_id, &batch_id).await?;
+            let size = self.read_batch_size(task_info.pkey, &batch_id).await?;
             Ok(OutstandingBatch::new(*task_id, batch_id, size))
         }))
         .await
@@ -4563,26 +4584,30 @@ WHERE task_id = $1
     //    aggregations in the batch which are in a non-failure state (START/WAITING/FINISHED).
     async fn read_batch_size(
         &self,
-        task_id: &TaskId,
+        task_pkey: i64,
         batch_id: &BatchId,
     ) -> Result<RangeInclusive<usize>, Error> {
-        // TODO(#1467): fix this to work in presence of GC.
         let stmt = self
             .prepare_cached(
                 "-- read_batch_size()
-WITH batch_report_aggregation_statuses AS
-    (SELECT report_aggregations.state, COUNT(*) AS count FROM report_aggregations
-     JOIN aggregation_jobs
+WITH report_aggregations_count AS (
+    SELECT COUNT(*) AS count FROM report_aggregations
+    JOIN aggregation_jobs
         ON report_aggregations.aggregation_job_id = aggregation_jobs.id
-     WHERE aggregation_jobs.task_id = (SELECT id FROM tasks WHERE task_id = $1)
-     AND report_aggregations.task_id = aggregation_jobs.task_id
-     AND aggregation_jobs.batch_id = $2
-     GROUP BY report_aggregations.state)
+    WHERE aggregation_jobs.task_id = $1
+    AND report_aggregations.task_id = aggregation_jobs.task_id
+    AND aggregation_jobs.batch_id = $2
+    AND report_aggregations.state in ('START', 'WAITING')
+),
+batch_aggregation_count AS (
+    SELECT SUM(report_count) AS count FROM batch_aggregations
+    WHERE batch_aggregations.task_id = $1
+    AND batch_aggregations.batch_identifier = $2
+)
 SELECT
-    (SELECT SUM(count)::BIGINT FROM batch_report_aggregation_statuses
-     WHERE state IN ('FINISHED')) AS min_size,
-    (SELECT SUM(count)::BIGINT FROM batch_report_aggregation_statuses
-     WHERE state IN ('START', 'WAITING', 'FINISHED')) AS max_size",
+    (SELECT count FROM batch_aggregation_count)::BIGINT AS min_size,
+    (SELECT count FROM report_aggregations_count)::BIGINT
+        + (SELECT count FROM batch_aggregation_count)::BIGINT AS max_size",
             )
             .await?;
 
@@ -4590,7 +4615,7 @@ SELECT
             .query_one(
                 &stmt,
                 &[
-                    /* task_id */ task_id.as_ref(),
+                    /* task_id */ &task_pkey,
                     /* batch_id */ batch_id.as_ref(),
                 ],
             )
@@ -4825,12 +4850,21 @@ WHERE id IN (SELECT id FROM aggregation_jobs_to_delete)",
         let stmt = self
             .prepare_cached(
                 "-- delete_expired_collection_artifacts()
-WITH batches_to_delete AS (
-    SELECT batch_identifier, aggregation_param
+WITH candidate_batches_to_delete AS (
+    SELECT DISTINCT batch_identifier, aggregation_param
     FROM batch_aggregations
     WHERE task_id = $1
-    GROUP BY batch_identifier, aggregation_param
-    HAVING MAX(UPPER(COALESCE(batch_interval, client_timestamp_interval))) < $2
+      AND UPPER(COALESCE(batch_interval, client_timestamp_interval)) < $2
+),
+batches_to_delete AS (
+    SELECT ba.batch_identifier, ba.aggregation_param
+    FROM batch_aggregations AS ba
+    JOIN candidate_batches_to_delete AS candidate
+      ON ba.batch_identifier = candidate.batch_identifier
+     AND ba.aggregation_param = candidate.aggregation_param
+    WHERE ba.task_id = $1
+    GROUP BY ba.batch_identifier, ba.aggregation_param
+    HAVING MAX(UPPER(COALESCE(ba.batch_interval, ba.client_timestamp_interval))) < $2
     LIMIT $3
 ),
 deleted_outstanding_batches AS (
@@ -4879,13 +4913,22 @@ SELECT COUNT(1) AS batch_count FROM batches_to_delete",
         row.get_bigint_and_convert("batch_count")
     }
 
+    /// Take an ExclusiveLock on the global_hpke_keys table.
+    #[tracing::instrument(skip(self), err(level = Level::DEBUG))]
+    pub async fn lock_global_hpke_keypairs(&self) -> Result<(), Error> {
+        self.raw_tx
+            .batch_execute("LOCK TABLE global_hpke_keys IN EXCLUSIVE MODE")
+            .await
+            .map_err(|err| err.into())
+    }
+
     /// Retrieve all global HPKE keypairs.
     #[tracing::instrument(skip(self), err(level = Level::DEBUG))]
     pub async fn get_global_hpke_keypairs(&self) -> Result<Vec<GlobalHpkeKeypair>, Error> {
         let stmt = self
             .prepare_cached(
                 "-- get_global_hpke_keypairs()
-SELECT config_id, config, private_key, state, updated_at FROM global_hpke_keys",
+SELECT config_id, config, private_key, state, last_state_change_at FROM global_hpke_keys",
             )
             .await?;
         let hpke_key_rows = self.query(&stmt, &[]).await?;
@@ -4905,7 +4948,7 @@ SELECT config_id, config, private_key, state, updated_at FROM global_hpke_keys",
         let stmt = self
             .prepare_cached(
                 "-- get_global_hpke_keypair()
-SELECT config_id, config, private_key, state, updated_at FROM global_hpke_keys
+SELECT config_id, config, private_key, state, last_state_change_at FROM global_hpke_keys
     WHERE config_id = $1",
             )
             .await?;
@@ -4929,7 +4972,7 @@ SELECT config_id, config, private_key, state, updated_at FROM global_hpke_keys
         Ok(GlobalHpkeKeypair::new(
             HpkeKeypair::new(config, private_key),
             row.get("state"),
-            Time::from_naive_date_time(&row.get("updated_at")),
+            Time::from_naive_date_time(&row.get("last_state_change_at")),
         ))
     }
 
@@ -4959,16 +5002,18 @@ DELETE FROM global_hpke_keys WHERE config_id = $1",
             .prepare_cached(
                 "-- set_global_hpke_keypair_state()
 UPDATE global_hpke_keys
-    SET state = $1, updated_at = $2, updated_by = $3
-    WHERE config_id = $4",
+    SET state = $1, last_state_change_at = $2, updated_at = $3, updated_by = $4
+    WHERE config_id = $5",
             )
             .await?;
+        let now = self.clock.now().as_naive_date_time()?;
         check_single_row_mutation(
             self.execute(
                 &stmt,
                 &[
                     /* state */ state,
-                    /* updated_at */ &self.clock.now().as_naive_date_time()?,
+                    /* last_state_change_at */ &now,
+                    /* updated_at */ &now,
                     /* updated_by */ &self.name,
                     /* config_id */ &(u8::from(*config_id) as i16),
                 ],
@@ -4977,7 +5022,7 @@ UPDATE global_hpke_keys
         )
     }
 
-    // Inserts a new global HPKE keypair and places it in the [`HpkeKeyState::Pending`] state.
+    /// Inserts a new global HPKE keypair and places it in the [`HpkeKeyState::Pending`] state.
     #[tracing::instrument(skip(self), err(level = Level::DEBUG))]
     pub async fn put_global_hpke_keypair(&self, hpke_keypair: &HpkeKeypair) -> Result<(), Error> {
         let hpke_config_id = u8::from(*hpke_keypair.config().id()) as i16;
@@ -4993,10 +5038,11 @@ UPDATE global_hpke_keys
             .prepare_cached(
                 "-- put_global_hpke_keypair()
 INSERT INTO global_hpke_keys
-    (config_id, config, private_key, created_at, updated_at, updated_by)
-    VALUES ($1, $2, $3, $4, $5, $6)",
+    (config_id, config, private_key, last_state_change_at, created_at, updated_at, updated_by)
+    VALUES ($1, $2, $3, $4, $5, $6, $7)",
             )
             .await?;
+        let now = self.clock.now().as_naive_date_time()?;
         check_insert(
             self.execute(
                 &stmt,
@@ -5004,8 +5050,9 @@ INSERT INTO global_hpke_keys
                     /* config_id */ &hpke_config_id,
                     /* config */ &hpke_config,
                     /* private_key */ &encrypted_hpke_private_key,
-                    /* created_at */ &self.clock.now().as_naive_date_time()?,
-                    /* updated_at */ &self.clock.now().as_naive_date_time()?,
+                    /* last_state_change_at */ &now,
+                    /* created_at */ &now,
+                    /* updated_at */ &now,
                     /* updated_by */ &self.name,
                 ],
             )
@@ -5449,6 +5496,74 @@ ON CONFLICT (task_id, ord) DO UPDATE SET
                     &i64::try_from(counter.report_success)?,
                     &i64::try_from(counter.report_too_early)?,
                     &i64::try_from(counter.task_expired)?,
+                ],
+            )
+            .await?,
+        )
+    }
+
+    /// Retrieves the task aggregation counters for a given task. This result reflects the overall
+    /// counter values, merged across all shards.
+    pub async fn get_task_aggregation_counter(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<Option<TaskAggregationCounter>, Error> {
+        let task_info = match self.task_info_for(task_id).await? {
+            Some(task_info) => task_info,
+            None => return Ok(None),
+        };
+
+        let stmt = self
+            .prepare_cached(
+                "-- get_task_aggregation_counter()
+SELECT
+    COALESCE(SUM(success)::BIGINT, 0) AS success
+FROM task_aggregation_counters
+WHERE task_id = $1",
+            )
+            .await?;
+
+        self.query_opt(&stmt, &[/* task_id */ &task_info.pkey])
+            .await?
+            .map(|row| {
+                Ok(TaskAggregationCounter {
+                    success: row.get_bigint_and_convert("success")?,
+                })
+            })
+            .transpose()
+    }
+
+    /// Increments the task aggregation counters for a given task by the values in the provided
+    /// counters. The `ord` parameter determines which "shard" of the counters to increment;
+    /// generally this value would be randomly-generated.
+    pub async fn increment_task_aggregation_counter(
+        &self,
+        task_id: &TaskId,
+        ord: u64,
+        counter: &TaskAggregationCounter,
+    ) -> Result<(), Error> {
+        let task_info = match self.task_info_for(task_id).await? {
+            Some(task_info) => task_info,
+            None => return Err(Error::MutationTargetNotFound),
+        };
+
+        let stmt = self
+            .prepare_cached(
+                "-- increment_task_aggregation_counter()
+INSERT INTO task_aggregation_counters (task_id, ord, success)
+VALUES ($1, $2, $3)
+ON CONFLICT (task_id, ord) DO UPDATE SET
+    success = task_aggregation_counters.success + $3",
+            )
+            .await?;
+
+        check_single_row_mutation(
+            self.execute(
+                &stmt,
+                &[
+                    /* task_id */ &task_info.pkey,
+                    /* ord */ &i64::try_from(ord)?,
+                    /* success */ &i64::try_from(counter.success)?,
                 ],
             )
             .await?,

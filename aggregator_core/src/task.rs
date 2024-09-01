@@ -5,7 +5,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use derivative::Derivative;
 use janus_core::{
     auth_tokens::{AuthenticationToken, AuthenticationTokenHash},
-    hpke::{generate_hpke_config_and_private_key, HpkeKeypair},
+    hpke::HpkeKeypair,
     time::TimeExt,
     vdaf::VdafInstance,
 };
@@ -155,13 +155,20 @@ impl CommonTaskParameters {
         time_precision: Duration,
         tolerable_clock_skew: Duration,
     ) -> Result<Self, Error> {
+        if min_batch_size == 0 {
+            return Err(Error::InvalidParameter("min_batch_size"));
+        }
+
         if let QueryType::FixedSize {
             max_batch_size: Some(max_batch_size),
-            ..
+            batch_time_window_size: Some(batch_time_window_size),
         } = query_type
         {
             if max_batch_size < min_batch_size {
                 return Err(Error::InvalidParameter("max_batch_size"));
+            }
+            if batch_time_window_size.as_seconds() == 0 {
+                return Err(Error::InvalidParameter("batch_time_window_size is zero"));
             }
         }
 
@@ -177,6 +184,10 @@ impl CommonTaskParameters {
             task_expiration
                 .as_naive_date_time()
                 .map_err(|_| Error::InvalidParameter("task_expiration out of range"))?;
+        }
+
+        if time_precision.as_seconds() == 0 {
+            return Err(Error::InvalidParameter("time_precision is zero"));
         }
 
         Ok(Self {
@@ -665,7 +676,7 @@ impl SerializedAggregatorTask {
 
         if self.hpke_keys.is_empty() {
             // Unwrap safety: we always use a supported KEM.
-            let hpke_keypair = generate_hpke_config_and_private_key(
+            let hpke_keypair = HpkeKeypair::generate(
                 random(),
                 HpkeKemId::X25519HkdfSha256,
                 HpkeKdfId::HkdfSha256,
@@ -787,13 +798,7 @@ pub mod test_util {
     use derivative::Derivative;
     use janus_core::{
         auth_tokens::{AuthenticationToken, AuthenticationTokenHash},
-        hpke::{
-            test_util::{
-                generate_test_hpke_config_and_private_key,
-                generate_test_hpke_config_and_private_key_with_id,
-            },
-            HpkeKeypair,
-        },
+        hpke::HpkeKeypair,
         time::DurationExt,
         url_ensure_trailing_slash,
         vdaf::VdafInstance,
@@ -1088,14 +1093,8 @@ pub mod test_util {
         pub fn new(query_type: QueryType, vdaf: VdafInstance) -> Self {
             let task_id = random();
 
-            let leader_hpke_keypairs = [
-                generate_test_hpke_config_and_private_key(),
-                generate_test_hpke_config_and_private_key_with_id(1),
-            ];
-            let helper_hpke_keypairs = [
-                generate_test_hpke_config_and_private_key(),
-                generate_test_hpke_config_and_private_key_with_id(1),
-            ];
+            let leader_hpke_keypairs = [HpkeKeypair::test(), HpkeKeypair::test_with_id(1)];
+            let helper_hpke_keypairs = [HpkeKeypair::test(), HpkeKeypair::test_with_id(1)];
 
             let vdaf_verify_key = SecretBytes::new(
                 thread_rng()
@@ -1114,10 +1113,10 @@ pub mod test_util {
                 1,
                 None,
                 None,
-                0,
+                1,
                 Duration::from_hours(8).unwrap(),
                 Duration::from_minutes(10).unwrap(),
-                /* Collector HPKE keypair */ generate_test_hpke_config_and_private_key(),
+                /* Collector HPKE keypair */ HpkeKeypair::test(),
                 /* Aggregator auth token */ random(),
                 /* Collector auth token */ random(),
                 leader_hpke_keypairs,
@@ -1345,6 +1344,7 @@ mod tests {
         hpke::{HpkeKeypair, HpkePrivateKey},
         test_util::roundtrip_encoding,
         time::DurationExt,
+        vdaf::vdaf_dp_strategies,
     };
     use janus_messages::{
         Duration, HpkeAeadId, HpkeConfig, HpkeConfigId, HpkeKdfId, HpkeKemId, HpkePublicKey, TaskId,
@@ -1656,6 +1656,7 @@ mod tests {
                     bits: 1,
                     length: 8,
                     chunk_length: 3,
+                    dp_strategy: vdaf_dp_strategies::Prio3SumVec::NoDifferentialPrivacy,
                 },
                 SecretBytes::new(b"1234567812345678".to_vec()),
                 1,
@@ -1717,7 +1718,7 @@ mod tests {
                 Token::StructVariant {
                     name: "VdafInstance",
                     variant: "Prio3SumVec",
-                    len: 3,
+                    len: 4,
                 },
                 Token::Str("bits"),
                 Token::U64(1),
@@ -1725,6 +1726,14 @@ mod tests {
                 Token::U64(8),
                 Token::Str("chunk_length"),
                 Token::U64(3),
+                Token::Str("dp_strategy"),
+                Token::Struct {
+                    name: "Prio3SumVec",
+                    len: 1,
+                },
+                Token::Str("dp_strategy"),
+                Token::Str("NoDifferentialPrivacy"),
+                Token::StructEnd,
                 Token::StructVariantEnd,
                 Token::Str("role"),
                 Token::UnitVariant {

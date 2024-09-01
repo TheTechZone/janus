@@ -38,7 +38,7 @@ use janus_messages::{
     query_type::TimeInterval, AggregationJobStep, Duration as DurationMsg, Interval, Role, TaskId,
 };
 use opentelemetry::{
-    metrics::{Histogram, Meter, Unit},
+    metrics::{Histogram, Meter},
     KeyValue,
 };
 #[cfg(feature = "fpvec_bounded_l2")]
@@ -68,7 +68,7 @@ use trillium_tokio::{CloneCounterObserver, Stopper};
 
 pub struct AggregationJobCreator<C: Clock> {
     // Dependencies.
-    datastore: Datastore<C>,
+    datastore: Arc<Datastore<C>>,
     meter: Meter,
 
     // Configuration values.
@@ -92,7 +92,7 @@ pub struct AggregationJobCreator<C: Clock> {
 
 impl<C: Clock + 'static> AggregationJobCreator<C> {
     pub fn new(
-        datastore: Datastore<C>,
+        datastore: Arc<Datastore<C>>,
         meter: Meter,
         batch_aggregation_shard_count: u64,
         tasks_update_frequency: Duration,
@@ -101,6 +101,10 @@ impl<C: Clock + 'static> AggregationJobCreator<C> {
         max_aggregation_job_size: usize,
         aggregation_job_creation_report_window: usize,
     ) -> AggregationJobCreator<C> {
+        assert!(
+            min_aggregation_job_size > 0,
+            "invalid configuration: min_aggregation_job_size cannot be zero"
+        );
         assert!(
             max_aggregation_job_size > 0,
             "invalid configuration: max_aggregation_job_size cannot be zero"
@@ -125,13 +129,13 @@ impl<C: Clock + 'static> AggregationJobCreator<C> {
             .meter
             .f64_histogram("janus_task_update_time")
             .with_description("Time spent updating tasks.")
-            .with_unit(Unit::new("s"))
+            .with_unit("s")
             .init();
         let job_creation_time_histogram = self
             .meter
             .f64_histogram("janus_job_creation_time")
             .with_description("Time spent creating aggregation jobs.")
-            .with_unit(Unit::new("s"))
+            .with_unit("s")
             .init();
 
         // Set up an interval to occasionally update our view of tasks in the DB.
@@ -298,7 +302,7 @@ impl<C: Clock + 'static> AggregationJobCreator<C> {
         fields(task_id = ?task.id()),
         err
     )]
-    async fn create_aggregation_jobs_for_task(
+    pub async fn create_aggregation_jobs_for_task(
         self: Arc<Self>,
         task: Arc<AggregatorTask>,
     ) -> anyhow::Result<bool> {
@@ -321,6 +325,7 @@ impl<C: Clock + 'static> AggregationJobCreator<C> {
                     bits,
                     length,
                     chunk_length,
+                    dp_strategy: _,
                 },
             ) => {
                 let vdaf = Arc::new(Prio3::new_sum_vec(2, *bits, *length, *chunk_length)?);
@@ -335,6 +340,7 @@ impl<C: Clock + 'static> AggregationJobCreator<C> {
                     bits,
                     length,
                     chunk_length,
+                    dp_strategy: _,
                 },
             ) => {
                 let vdaf = Arc::new(new_prio3_sum_vec_field64_multiproof_hmacsha256_aes128::<
@@ -351,6 +357,7 @@ impl<C: Clock + 'static> AggregationJobCreator<C> {
                 VdafInstance::Prio3Histogram {
                     length,
                     chunk_length,
+                    dp_strategy: _,
                 },
             ) => {
                 let vdaf = Arc::new(Prio3::new_histogram(2, *length, *chunk_length)?);
@@ -431,6 +438,7 @@ impl<C: Clock + 'static> AggregationJobCreator<C> {
                     bits,
                     length,
                     chunk_length,
+                    dp_strategy: _,
                 },
             ) => {
                 let vdaf = Arc::new(Prio3::new_sum_vec(2, *bits, *length, *chunk_length)?);
@@ -452,6 +460,7 @@ impl<C: Clock + 'static> AggregationJobCreator<C> {
                     bits,
                     length,
                     chunk_length,
+                    dp_strategy: _,
                 },
             ) => {
                 let vdaf = Arc::new(new_prio3_sum_vec_field64_multiproof_hmacsha256_aes128::<
@@ -473,6 +482,7 @@ impl<C: Clock + 'static> AggregationJobCreator<C> {
                 VdafInstance::Prio3Histogram {
                     length,
                     chunk_length,
+                    dp_strategy: _,
                 },
             ) => {
                 let vdaf = Arc::new(Prio3::new_histogram(2, *length, *chunk_length)?);
@@ -923,7 +933,7 @@ mod tests {
         test_util::noop_meter,
     };
     use janus_core::{
-        hpke::test_util::generate_test_hpke_config_and_private_key,
+        hpke::HpkeKeypair,
         test_util::{install_test_trace_subscriber, run_vdaf},
         time::{Clock, DurationExt, IntervalExt, MockClock, TimeExt},
         vdaf::{VdafInstance, VERIFY_KEY_LENGTH},
@@ -978,7 +988,7 @@ mod tests {
         let batch_identifier =
             TimeInterval::to_batch_identifier(&leader_task, &(), &report_time).unwrap();
         let vdaf = Arc::new(Prio3::new_count(2).unwrap());
-        let helper_hpke_keypair = generate_test_hpke_config_and_private_key();
+        let helper_hpke_keypair = HpkeKeypair::test();
         let leader_report_metadata = ReportMetadata::new(random(), report_time);
         let leader_transcript = run_vdaf(
             vdaf.as_ref(),
@@ -1028,7 +1038,7 @@ mod tests {
         // kill it.
         const AGGREGATION_JOB_CREATION_INTERVAL: Duration = Duration::from_secs(1);
         let job_creator = Arc::new(AggregationJobCreator::new(
-            ds,
+            Arc::new(ds),
             noop_meter(),
             BATCH_AGGREGATION_SHARD_COUNT,
             Duration::from_secs(3600),
@@ -1160,7 +1170,7 @@ mod tests {
         // batches shouldn't have any aggregation jobs in common since we can fill our aggregation
         // jobs without overlap.
         let vdaf = Arc::new(Prio3::new_count(2).unwrap());
-        let helper_hpke_keypair = generate_test_hpke_config_and_private_key();
+        let helper_hpke_keypair = HpkeKeypair::test();
 
         let first_report_time = clock.now();
         let second_report_time = clock.now().add(task.time_precision()).unwrap();
@@ -1209,7 +1219,7 @@ mod tests {
 
         // Run.
         let job_creator = Arc::new(AggregationJobCreator::new(
-            ds,
+            Arc::new(ds),
             noop_meter(),
             BATCH_AGGREGATION_SHARD_COUNT,
             Duration::from_secs(3600),
@@ -1345,7 +1355,7 @@ mod tests {
         let report_time = clock.now();
         let batch_identifier = TimeInterval::to_batch_identifier(&task, &(), &report_time).unwrap();
         let vdaf = Arc::new(Prio3::new_count(2).unwrap());
-        let helper_hpke_keypair = generate_test_hpke_config_and_private_key();
+        let helper_hpke_keypair = HpkeKeypair::test();
 
         let first_report_metadata = ReportMetadata::new(random(), report_time);
         let first_transcript = run_vdaf(
@@ -1394,7 +1404,7 @@ mod tests {
 
         // Run.
         let job_creator = Arc::new(AggregationJobCreator::new(
-            ds,
+            Arc::new(ds),
             noop_meter(),
             BATCH_AGGREGATION_SHARD_COUNT,
             Duration::from_secs(3600),
@@ -1555,7 +1565,7 @@ mod tests {
         // Create a min-size batch.
         let report_time = clock.now();
         let vdaf = Arc::new(Prio3::new_count(2).unwrap());
-        let helper_hpke_keypair = generate_test_hpke_config_and_private_key();
+        let helper_hpke_keypair = HpkeKeypair::test();
         let batch_identifier = TimeInterval::to_batch_identifier(&task, &(), &report_time).unwrap();
         let reports: Arc<Vec<_>> = Arc::new(
             iter::repeat_with(|| {
@@ -1620,7 +1630,7 @@ mod tests {
 
         // Run.
         let job_creator = Arc::new(AggregationJobCreator::new(
-            ds,
+            Arc::new(ds),
             noop_meter(),
             1,
             Duration::from_secs(3600),
@@ -1742,7 +1752,7 @@ mod tests {
         // containing these reports.
         let report_time = clock.now();
         let vdaf = Arc::new(Prio3::new_count(2).unwrap());
-        let helper_hpke_keypair = generate_test_hpke_config_and_private_key();
+        let helper_hpke_keypair = HpkeKeypair::test();
         let reports: Arc<Vec<_>> = Arc::new(
             iter::repeat_with(|| {
                 let report_metadata = ReportMetadata::new(random(), report_time);
@@ -1787,7 +1797,7 @@ mod tests {
 
         // Run.
         let job_creator = Arc::new(AggregationJobCreator::new(
-            ds,
+            Arc::new(ds),
             noop_meter(),
             BATCH_AGGREGATION_SHARD_COUNT,
             Duration::from_secs(3600),
@@ -1964,7 +1974,7 @@ mod tests {
         // the reports should remain "unaggregated".
         let report_time = clock.now();
         let vdaf = Arc::new(Prio3::new_count(2).unwrap());
-        let helper_hpke_keypair = generate_test_hpke_config_and_private_key();
+        let helper_hpke_keypair = HpkeKeypair::test();
         let reports: Arc<Vec<_>> = Arc::new(
             iter::repeat_with(|| {
                 let report_metadata = ReportMetadata::new(random(), report_time);
@@ -2004,7 +2014,7 @@ mod tests {
 
         // Run.
         let job_creator = Arc::new(AggregationJobCreator::new(
-            ds,
+            Arc::new(ds),
             meter,
             BATCH_AGGREGATION_SHARD_COUNT,
             Duration::from_secs(3600),
@@ -2128,7 +2138,7 @@ mod tests {
         // of reports for the second batch.
         let report_time = clock.now();
         let vdaf = Arc::new(Prio3::new_count(2).unwrap());
-        let helper_hpke_keypair = generate_test_hpke_config_and_private_key();
+        let helper_hpke_keypair = HpkeKeypair::test();
         let reports: Arc<Vec<_>> = Arc::new(
             iter::repeat_with(|| {
                 let report_metadata = ReportMetadata::new(random(), report_time);
@@ -2173,7 +2183,7 @@ mod tests {
 
         // Run.
         let job_creator = Arc::new(AggregationJobCreator::new(
-            ds,
+            Arc::new(ds),
             meter,
             BATCH_AGGREGATION_SHARD_COUNT,
             Duration::from_secs(3600),
@@ -2392,7 +2402,7 @@ mod tests {
         // job with the remainder of the reports.
         let report_time = clock.now();
         let vdaf = Arc::new(Prio3::new_count(2).unwrap());
-        let helper_hpke_keypair = generate_test_hpke_config_and_private_key();
+        let helper_hpke_keypair = HpkeKeypair::test();
         let reports: Arc<Vec<_>> = Arc::new(
             iter::repeat_with(|| {
                 let report_metadata = ReportMetadata::new(random(), report_time);
@@ -2437,7 +2447,7 @@ mod tests {
 
         // Run.
         let job_creator = Arc::new(AggregationJobCreator::new(
-            ds,
+            Arc::new(ds),
             meter,
             BATCH_AGGREGATION_SHARD_COUNT,
             Duration::from_secs(3600),
@@ -2665,7 +2675,7 @@ mod tests {
         let report_time_1 = clock.now().sub(&batch_time_window_size).unwrap();
         let report_time_2 = clock.now();
         let vdaf = Arc::new(Prio3::new_count(2).unwrap());
-        let helper_hpke_keypair = generate_test_hpke_config_and_private_key();
+        let helper_hpke_keypair = HpkeKeypair::test();
 
         let mut reports = Vec::new();
         reports.extend(
@@ -2732,7 +2742,7 @@ mod tests {
 
         // Run.
         let job_creator = Arc::new(AggregationJobCreator::new(
-            ds,
+            Arc::new(ds),
             meter,
             BATCH_AGGREGATION_SHARD_COUNT,
             Duration::from_secs(3600),
@@ -2979,7 +2989,7 @@ mod tests {
         // aggregation jobs to be created containing all these reports, but only two batches.
         let report_time = clock.now();
         let vdaf = Arc::new(Prio3::new_count(2).unwrap());
-        let helper_hpke_keypair = generate_test_hpke_config_and_private_key();
+        let helper_hpke_keypair = HpkeKeypair::test();
         let reports: Arc<Vec<_>> = Arc::new(
             iter::repeat_with(|| {
                 let report_metadata = ReportMetadata::new(random(), report_time);
@@ -3024,7 +3034,7 @@ mod tests {
 
         // Run.
         let job_creator = Arc::new(AggregationJobCreator::new(
-            ds,
+            Arc::new(ds),
             noop_meter(),
             BATCH_AGGREGATION_SHARD_COUNT,
             Duration::from_secs(3600),
@@ -3229,7 +3239,7 @@ mod tests {
         .unwrap();
 
         let job_creator = Arc::new(AggregationJobCreator::new(
-            ds,
+            Arc::new(ds),
             noop_meter(),
             BATCH_AGGREGATION_SHARD_COUNT,
             Duration::from_secs(3600),

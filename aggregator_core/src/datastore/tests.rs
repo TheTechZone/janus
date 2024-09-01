@@ -6,7 +6,7 @@ use crate::{
             CollectionJobState, CollectionJobStateCode, GlobalHpkeKeypair, HpkeKeyState,
             LeaderStoredReport, Lease, OutstandingBatch, ReportAggregation,
             ReportAggregationMetadata, ReportAggregationMetadataState, ReportAggregationState,
-            SqlInterval, TaskUploadCounter,
+            SqlInterval, TaskAggregationCounter, TaskUploadCounter,
         },
         schema_versions_template,
         test_util::{
@@ -25,12 +25,10 @@ use async_trait::async_trait;
 use chrono::NaiveDate;
 use futures::future::try_join_all;
 use janus_core::{
-    hpke::{
-        self, test_util::generate_test_hpke_config_and_private_key, HpkeApplicationInfo, Label,
-    },
+    hpke::{self, HpkeApplicationInfo, Label},
     test_util::{install_test_trace_subscriber, run_vdaf},
     time::{Clock, DurationExt, IntervalExt, MockClock, TimeExt},
-    vdaf::{VdafInstance, VERIFY_KEY_LENGTH},
+    vdaf::{vdaf_dp_strategies, VdafInstance, VERIFY_KEY_LENGTH},
 };
 use janus_messages::{
     query_type::{FixedSize, QueryType, TimeInterval},
@@ -41,6 +39,9 @@ use janus_messages::{
 };
 use prio::{
     codec::{Decode, Encode},
+    dp::{
+        distributions::PureDpDiscreteLaplace, DifferentialPrivacyStrategy, PureDpBudget, Rational,
+    },
     idpf::IdpfInput,
     topology::ping_pong::PingPongMessage,
     vdaf::{
@@ -155,6 +156,20 @@ async fn roundtrip_task(ephemeral_datastore: EphemeralDatastore) {
                 bits: 1,
                 length: 8,
                 chunk_length: 3,
+                dp_strategy: vdaf_dp_strategies::Prio3SumVec::NoDifferentialPrivacy,
+            },
+            Role::Leader,
+        ),
+        (
+            VdafInstance::Prio3SumVec {
+                bits: 1,
+                length: 8,
+                chunk_length: 3,
+                dp_strategy: vdaf_dp_strategies::Prio3SumVec::PureDpDiscreteLaplace(
+                    PureDpDiscreteLaplace::from_budget(
+                        PureDpBudget::new(Rational::from_unsigned(1u128, 4u128).unwrap()).unwrap(),
+                    ),
+                ),
             },
             Role::Leader,
         ),
@@ -163,6 +178,7 @@ async fn roundtrip_task(ephemeral_datastore: EphemeralDatastore) {
                 bits: 1,
                 length: 64,
                 chunk_length: 10,
+                dp_strategy: vdaf_dp_strategies::Prio3SumVec::NoDifferentialPrivacy,
             },
             Role::Helper,
         ),
@@ -172,6 +188,7 @@ async fn roundtrip_task(ephemeral_datastore: EphemeralDatastore) {
             VdafInstance::Prio3Histogram {
                 length: 4,
                 chunk_length: 2,
+                dp_strategy: vdaf_dp_strategies::Prio3Histogram::NoDifferentialPrivacy,
             },
             Role::Leader,
         ),
@@ -179,6 +196,7 @@ async fn roundtrip_task(ephemeral_datastore: EphemeralDatastore) {
             VdafInstance::Prio3Histogram {
                 length: 5,
                 chunk_length: 2,
+                dp_strategy: vdaf_dp_strategies::Prio3Histogram::NoDifferentialPrivacy,
             },
             Role::Leader,
         ),
@@ -5158,6 +5176,9 @@ async fn roundtrip_outstanding_batch(ephemeral_datastore: EphemeralDatastore) {
                         .unwrap(),
                     BatchAggregationState::Aggregating {
                         aggregate_share: Some(dummy::AggregateShare(0)),
+                        // Let report_count be 1 without an accompanying report_aggregation in a
+                        // terminal state. This captures the case where a FINISHED report_aggregation
+                        // was garbage collected and no longer exists in the database.
                         report_count: 1,
                         checksum: ReportIdChecksum::default(),
                         aggregation_jobs_created: 4,
@@ -5411,7 +5432,7 @@ async fn roundtrip_outstanding_batch(ephemeral_datastore: EphemeralDatastore) {
         Vec::from([OutstandingBatch::new(
             task_id_2,
             batch_id_2,
-            RangeInclusive::new(0, 1)
+            RangeInclusive::new(1, 2)
         )])
     );
     assert_eq!(outstanding_batches_task_2_after_mark, Vec::new());
@@ -7187,10 +7208,12 @@ SELECT (lower(interval) = '2021-10-05 00:00:00' AND
 #[rstest_reuse::apply(schema_versions_template)]
 #[tokio::test]
 async fn roundtrip_global_hpke_keypair(ephemeral_datastore: EphemeralDatastore) {
+    use janus_core::hpke::HpkeKeypair;
+
     install_test_trace_subscriber();
     let datastore = ephemeral_datastore.datastore(MockClock::default()).await;
     let clock = datastore.clock.clone();
-    let keypair = generate_test_hpke_config_and_private_key();
+    let keypair = HpkeKeypair::test();
 
     datastore
         .run_tx("test-put-keys", |tx| {
@@ -7224,7 +7247,7 @@ async fn roundtrip_global_hpke_keypair(ephemeral_datastore: EphemeralDatastore) 
                         .await
                         .unwrap()
                         .unwrap(),
-                    GlobalHpkeKeypair::new(keypair.clone(), HpkeKeyState::Active, clock.now(),)
+                    GlobalHpkeKeypair::new(keypair.clone(), HpkeKeyState::Active, clock.now())
                 );
 
                 clock.advance(&Duration::from_seconds(100));
@@ -7236,7 +7259,7 @@ async fn roundtrip_global_hpke_keypair(ephemeral_datastore: EphemeralDatastore) 
                         .await
                         .unwrap()
                         .unwrap(),
-                    GlobalHpkeKeypair::new(keypair.clone(), HpkeKeyState::Expired, clock.now(),)
+                    GlobalHpkeKeypair::new(keypair.clone(), HpkeKeyState::Expired, clock.now())
                 );
 
                 Ok(())
@@ -7557,6 +7580,75 @@ async fn roundtrip_task_upload_counter(ephemeral_datastore: EphemeralDatastore) 
                         task_expired: 20,
                     })
                 );
+
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+}
+
+#[rstest_reuse::apply(schema_versions_template)]
+#[tokio::test]
+async fn roundtrip_task_aggregation_counter(ephemeral_datastore: EphemeralDatastore) {
+    install_test_trace_subscriber();
+    let clock = MockClock::default();
+    let datastore = ephemeral_datastore.datastore(clock.clone()).await;
+
+    datastore
+        .run_unnamed_tx(|tx| {
+            Box::pin(async move {
+                // Returns None for non-existent task.
+                let counter = tx.get_task_aggregation_counter(&random()).await.unwrap();
+                assert_eq!(counter, None);
+
+                // Put a task for us to increment counters for.
+                let task = TaskBuilder::new(
+                    task::QueryType::FixedSize {
+                        max_batch_size: None,
+                        batch_time_window_size: None,
+                    },
+                    VdafInstance::Fake { rounds: 1 },
+                )
+                .build()
+                .leader_view()
+                .unwrap();
+
+                tx.put_aggregator_task(&task).await.unwrap();
+
+                // Returns Some for a task that has just been created and has no counters.
+                let counter = tx.get_task_aggregation_counter(task.id()).await.unwrap();
+                assert_eq!(counter, Some(TaskAggregationCounter::default()));
+
+                let ord = thread_rng().gen_range(0..32);
+                tx.increment_task_aggregation_counter(
+                    task.id(),
+                    ord,
+                    &TaskAggregationCounter { success: 4 },
+                )
+                .await
+                .unwrap();
+
+                let ord = thread_rng().gen_range(0..32);
+                tx.increment_task_aggregation_counter(
+                    task.id(),
+                    ord,
+                    &TaskAggregationCounter { success: 6 },
+                )
+                .await
+                .unwrap();
+
+                let ord = thread_rng().gen_range(0..32);
+                tx.increment_task_aggregation_counter(
+                    task.id(),
+                    ord,
+                    &TaskAggregationCounter::default(),
+                )
+                .await
+                .unwrap();
+
+                let counter = tx.get_task_aggregation_counter(task.id()).await.unwrap();
+                assert_eq!(counter, Some(TaskAggregationCounter { success: 10 }));
 
                 Ok(())
             })

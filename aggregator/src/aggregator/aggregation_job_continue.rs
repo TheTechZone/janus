@@ -8,7 +8,9 @@ use crate::aggregator::{
 use janus_aggregator_core::{
     datastore::{
         self,
-        models::{AggregationJob, ReportAggregation, ReportAggregationState},
+        models::{
+            AggregationJob, ReportAggregation, ReportAggregationState, TaskAggregationCounter,
+        },
         Transaction,
     },
     query_type::AccumulableQueryType,
@@ -42,7 +44,7 @@ impl VdafOps {
         req: Arc<AggregationJobContinueReq>,
         request_hash: [u8; 32],
         metrics: &AggregatorMetrics,
-    ) -> Result<AggregationJobResp, datastore::Error>
+    ) -> Result<(AggregationJobResp, TaskAggregationCounter), datastore::Error>
     where
         C: Clock,
         Q: AccumulableQueryType,
@@ -271,9 +273,7 @@ impl VdafOps {
         // Write accumulated aggregation values back to the datastore; this will mark any reports
         // that can't be aggregated because the batch is collected with error BatchCollected.
         let aggregation_job_id = *aggregation_job.id();
-        // TODO: Use Arc::unwrap_or_clone() once the MSRV is at least 1.76.0.
-        let aggregation_job = Arc::try_unwrap(aggregation_job)
-            .unwrap_or_else(|arc| arc.as_ref().clone())
+        let aggregation_job = Arc::unwrap_or_clone(aggregation_job)
             .with_step(request_step) // Advance the job to the leader's step
             .with_last_request_hash(request_hash);
         let mut aggregation_job_writer =
@@ -283,12 +283,15 @@ impl VdafOps {
                 Some(metrics.for_aggregation_job_writer()),
             );
         aggregation_job_writer.put(aggregation_job, report_aggregations_to_write)?;
-        let prepare_resps = aggregation_job_writer
-            .write(tx, vdaf)
-            .await?
-            .remove(&aggregation_job_id)
-            .unwrap_or_default();
-        Ok(AggregationJobResp::new(prepare_resps))
+        let (mut prep_resps_by_agg_job, counters) = aggregation_job_writer.write(tx, vdaf).await?;
+        Ok((
+            AggregationJobResp::new(
+                prep_resps_by_agg_job
+                    .remove(&aggregation_job_id)
+                    .unwrap_or_default(),
+            ),
+            counters,
+        ))
     }
 }
 
@@ -398,7 +401,7 @@ mod tests {
         },
         http_handlers::{
             aggregator_handler,
-            test_util::{setup_http_handler_test, take_problem_details},
+            test_util::{take_problem_details, HttpHandlerTest},
         },
         test_util::default_aggregator_config,
     };
@@ -471,6 +474,7 @@ mod tests {
         let ephemeral_datastore = ephemeral_datastore().await;
         let meter = noop_meter();
         let datastore = Arc::new(ephemeral_datastore.datastore(clock.clone()).await);
+        let keypair = datastore.put_global_hpke_key().await.unwrap();
 
         let aggregation_parameter = Poplar1AggregationParam::try_from_prefixes(Vec::from([
             IdpfInput::from_bools(&[false]),
@@ -479,6 +483,7 @@ mod tests {
         let prepare_init_generator = PrepareInitGenerator::new(
             clock.clone(),
             helper_task.clone(),
+            keypair.config().clone(),
             Poplar1::new_turboshake128(1),
             aggregation_parameter.clone(),
         );
@@ -606,7 +611,12 @@ mod tests {
 
     #[tokio::test]
     async fn leader_rejects_aggregation_job_post() {
-        let (_, _ephemeral_datastore, datastore, handler) = setup_http_handler_test().await;
+        let HttpHandlerTest {
+            ephemeral_datastore: _ephemeral_datastore,
+            datastore,
+            handler,
+            ..
+        } = HttpHandlerTest::new().await;
 
         let task = TaskBuilder::new(QueryType::TimeInterval, VdafInstance::Prio3Count).build();
         datastore
@@ -632,7 +642,12 @@ mod tests {
 
     #[tokio::test]
     async fn leader_rejects_aggregation_job_delete() {
-        let (_, _ephemeral_datastore, datastore, handler) = setup_http_handler_test().await;
+        let HttpHandlerTest {
+            ephemeral_datastore: _ephemeral_datastore,
+            datastore,
+            handler,
+            ..
+        } = HttpHandlerTest::new().await;
 
         let task = TaskBuilder::new(QueryType::TimeInterval, VdafInstance::Prio3Count).build();
         datastore

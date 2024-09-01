@@ -6,46 +6,56 @@
 //!
 //! # Examples
 //!
+//! Initialize an instance of [`Collector`].
+//!
 //! ```no_run
-//! use janus_collector::{AuthenticationToken, Collector};
-//! use janus_core::{hpke::generate_hpke_config_and_private_key};
-//! use janus_messages::{
-//!     Duration, HpkeAeadId, HpkeConfig, HpkeConfigId, HpkeKdfId, HpkeKemId, Interval, TaskId,
-//!     Time, Query,
-//! };
+//! use std::{fs::File, str::FromStr};
+//!
+//! use janus_collector::{Collector, PrivateCollectorCredential};
+//! use janus_messages::{Duration, FixedSizeQuery, Interval, Query, TaskId, Time};
 //! use prio::vdaf::prio3::Prio3;
-//! use rand::random;
 //! use url::Url;
 //!
 //! # async fn run() {
-//! // Supply DAP task parameters.
-//! let task_id = random();
-//! let hpke_keypair = janus_core::hpke::generate_hpke_config_and_private_key(
-//!     HpkeConfigId::from(0),
-//!     HpkeKemId::X25519HkdfSha256,
-//!     HpkeKdfId::HkdfSha256,
-//!     HpkeAeadId::Aes128Gcm,
-//! ).unwrap();
+//! let task_id = TaskId::from_str("[your DAP task ID here]").unwrap();
+//!
+//! let collector_credential: PrivateCollectorCredential =
+//!     serde_json::from_reader(File::open("[path to JSON encoded collector credential]").unwrap())
+//!         .unwrap();
+//!
+//! let leader_url =
+//!     Url::from_str("[absolute URI to the DAP leader, e.g. https://leader.dap.example.com/]")
+//!         .unwrap();
 //!
 //! // Supply a VDAF implementation, corresponding to this task.
 //! let vdaf = Prio3::new_count(2).unwrap();
+//!
 //! let collector = Collector::new(
 //!     task_id,
-//!     "https://example.com/dap/".parse().unwrap(),
-//!     AuthenticationToken::new_bearer_token_from_string("Y29sbGVjdG9yIHRva2Vu").unwrap(),
-//!     hpke_keypair,
+//!     leader_url,
+//!     collector_credential.authentication_token(),
+//!     collector_credential.hpke_keypair(),
 //!     vdaf,
 //! )
 //! .unwrap();
 //!
-//! // Specify the time interval over which the aggregation should be calculated.
+//! // If this is a time interval task, specify the time interval over which the aggregation
+//! // should be calculated.
 //! let interval = Interval::new(
 //!     Time::from_seconds_since_epoch(1_656_000_000),
 //!     Duration::from_seconds(3600),
 //! )
 //! .unwrap();
+//!
 //! // Make the requests and retrieve the aggregated statistic.
-//! let aggregation_result = collector.collect(Query::new_time_interval(interval), &()).await.unwrap();
+//! let aggregation_result = collector
+//!     .collect(Query::new_time_interval(interval), &())
+//!     .await
+//!     .unwrap();
+//!
+//! // Or if this is a fixed size task, make a fixed size query.
+//! let query = Query::new_fixed_size(FixedSizeQuery::CurrentBatch);
+//! let aggregation_result = collector.collect(query, &()).await.unwrap();
 //! # }
 //! ```
 
@@ -754,9 +764,7 @@ mod tests {
     use fixed_macro::fixed;
     use janus_core::{
         auth_tokens::AuthenticationToken,
-        hpke::{
-            self, test_util::generate_test_hpke_config_and_private_key, HpkeApplicationInfo, Label,
-        },
+        hpke::{self, HpkeApplicationInfo, HpkeKeypair, Label},
         retries::test_util::test_http_request_exponential_backoff,
         test_util::{install_test_trace_subscriber, run_vdaf, VdafTranscript},
     };
@@ -782,7 +790,7 @@ mod tests {
 
     fn setup_collector<V: vdaf::Collector>(server: &mut mockito::Server, vdaf: V) -> Collector<V> {
         let server_url = Url::parse(&server.url()).unwrap();
-        let hpke_keypair = generate_test_hpke_config_and_private_key();
+        let hpke_keypair = HpkeKeypair::test();
         Collector::builder(
             random(),
             server_url,
@@ -876,7 +884,7 @@ mod tests {
 
     #[test]
     fn leader_endpoint_end_in_slash() {
-        let hpke_keypair = generate_test_hpke_config_and_private_key();
+        let hpke_keypair = HpkeKeypair::test();
         let collector = Collector::new(
             random(),
             "http://example.com/dap".parse().unwrap(),
@@ -1296,7 +1304,7 @@ mod tests {
         let vdaf = Prio3::new_count(2).unwrap();
         let transcript = run_vdaf(&vdaf, &random(), &(), &random(), &true);
         let server_url = Url::parse(&server.url()).unwrap();
-        let hpke_keypair = generate_test_hpke_config_and_private_key();
+        let hpke_keypair = HpkeKeypair::test();
         let collector = Collector::builder(
             random(),
             server_url,

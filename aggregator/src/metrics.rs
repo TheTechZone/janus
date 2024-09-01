@@ -2,7 +2,7 @@
 
 use anyhow::anyhow;
 use opentelemetry::{
-    metrics::{Counter, Meter, Unit},
+    metrics::{Counter, Histogram, Meter},
     KeyValue,
 };
 use serde::{Deserialize, Serialize};
@@ -12,7 +12,6 @@ use tokio::runtime::Runtime;
 #[cfg(feature = "prometheus")]
 use {
     anyhow::Context,
-    opentelemetry::global::set_meter_provider,
     prometheus::Registry,
     std::{
         net::{IpAddr, Ipv4Addr},
@@ -36,9 +35,9 @@ use {
 
 #[cfg(any(feature = "otlp", feature = "prometheus"))]
 use {
-    crate::git_revision,
+    janus_aggregator_api::git_revision,
     janus_aggregator_core::datastore::TRANSACTION_RETRIES_METER_NAME,
-    opentelemetry::metrics::MetricsError,
+    opentelemetry::{global::set_meter_provider, metrics::MetricsError},
     opentelemetry_sdk::{
         metrics::{
             new_view, Aggregation, Instrument, InstrumentKind, SdkMeterProvider, Stream, View,
@@ -50,6 +49,8 @@ use {
 #[cfg(all(tokio_unstable, feature = "prometheus"))]
 pub(crate) mod tokio_runtime;
 
+#[cfg(test)]
+pub(crate) mod test_util;
 #[cfg(test)]
 mod tests;
 
@@ -66,6 +67,7 @@ pub enum Error {
 
 /// Configuration for collection/exporting of application-level metrics.
 #[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MetricsConfiguration {
     /// Configuration for OpenTelemetry metrics, with a choice of exporters.
     #[serde(default, with = "serde_yaml::with::singleton_map")]
@@ -78,7 +80,7 @@ pub struct MetricsConfiguration {
 
 /// Selection of an exporter for OpenTelemetry metrics.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(deny_unknown_fields, rename_all = "lowercase")]
 pub enum MetricsExporterConfiguration {
     Prometheus {
         host: Option<String>,
@@ -89,6 +91,7 @@ pub enum MetricsExporterConfiguration {
 
 /// Configuration options specific to the OpenTelemetry OTLP metrics exporter.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OtlpExporterConfiguration {
     /// gRPC endpoint for OTLP exporter.
     pub endpoint: String,
@@ -96,6 +99,7 @@ pub struct OtlpExporterConfiguration {
 
 /// Configuration options for Tokio's (unstable) metrics feature.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TokioMetricsConfiguration {
     /// Enable collecting metrics from Tokio. The flag `--cfg tokio_unstable` must be passsed
     /// to the compiler if this is enabled.
@@ -114,11 +118,12 @@ pub struct TokioMetricsConfiguration {
     #[serde(default)]
     pub poll_time_histogram_scale: HistogramScale,
 
-    /// Resolution of the histogram tracking poll times. When using a linear scale, every bucket
-    /// will have this width. When using a logarithmic scale, the smallest bucket will have this
-    /// width.
-    #[serde(default)]
-    pub poll_time_histogram_resolution_microseconds: Option<u64>,
+    /// Resolution of the histogram tracking poll times, in microseconds. When using a linear
+    /// scale, every bucket will have this width. When using a logarithmic scale, the smallest
+    /// bucket will have this width.
+    // TODO(#3293): remove this alias during next breaking changes window.
+    #[serde(default, alias = "poll_time_histogram_resolution_microseconds")]
+    pub poll_time_histogram_resolution_us: Option<u64>,
 
     /// Chooses the number of buckets in the histogram used to track poll times. This number of
     /// buckets includes the bucket with a range extending to positive infinity.
@@ -153,24 +158,29 @@ pub enum MetricsExporterHandle {
 
 #[cfg(any(feature = "prometheus", feature = "otlp"))]
 struct CustomView {
-    uint_histogram_view: Box<dyn View>,
+    retries_histogram_view: Box<dyn View>,
+    vdaf_dimension_histogram_view: Box<dyn View>,
     bytes_histogram_view: Box<dyn View>,
     default_histogram_view: Box<dyn View>,
 }
 
 #[cfg(any(feature = "prometheus", feature = "otlp"))]
 impl CustomView {
+    /// These boundaries are for the number of times a database transaction was retried.
+    const RETRIES_HISTOGRAM_BOUNDARIES: &'static [f64] = &[
+        1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0,
+        16384.0,
+    ];
+
+    /// These boundaries are for the dimensions of VDAF measurements.
+    const VDAF_DIMENSION_HISTOGRAM_VALUES: &'static [f64] = &[
+        1.0, 4.0, 16.0, 64.0, 256.0, 1024.0, 4096.0, 16384.0, 65536.0, 262144.0,
+    ];
+
     /// These boundaries are intended to be used with measurements having the unit of "bytes".
     const BYTES_HISTOGRAM_BOUNDARIES: &'static [f64] = &[
         1024.0, 2048.0, 4096.0, 8192.0, 16384.0, 32768.0, 65536.0, 131072.0, 262144.0, 524288.0,
         1048576.0, 2097152.0, 4194304.0, 8388608.0, 16777216.0, 33554432.0,
-    ];
-
-    /// These boundaries are for measurements of unsigned integers, such as the number of retries
-    /// that an operation took.
-    const UINT_HISTOGRAM_BOUNDARIES: &'static [f64] = &[
-        1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0,
-        16384.0,
     ];
 
     /// These boundaries are intended to be able to capture the length of short-lived operations
@@ -180,23 +190,31 @@ impl CustomView {
     ];
 
     pub fn new() -> Result<Self, MetricsError> {
+        let wildcard_instrument = Instrument::new().name("*");
         Ok(Self {
-            uint_histogram_view: new_view(
-                Instrument::new().name("*"),
+            retries_histogram_view: new_view(
+                wildcard_instrument.clone(),
                 Stream::new().aggregation(Aggregation::ExplicitBucketHistogram {
-                    boundaries: Vec::from(Self::UINT_HISTOGRAM_BOUNDARIES),
+                    boundaries: Vec::from(Self::RETRIES_HISTOGRAM_BOUNDARIES),
+                    record_min_max: true,
+                }),
+            )?,
+            vdaf_dimension_histogram_view: new_view(
+                wildcard_instrument.clone(),
+                Stream::new().aggregation(Aggregation::ExplicitBucketHistogram {
+                    boundaries: Vec::from(Self::VDAF_DIMENSION_HISTOGRAM_VALUES),
                     record_min_max: true,
                 }),
             )?,
             bytes_histogram_view: new_view(
-                Instrument::new().name("*"),
+                wildcard_instrument.clone(),
                 Stream::new().aggregation(Aggregation::ExplicitBucketHistogram {
                     boundaries: Vec::from(Self::BYTES_HISTOGRAM_BOUNDARIES),
                     record_min_max: true,
                 }),
             )?,
             default_histogram_view: new_view(
-                Instrument::new().name("*"),
+                wildcard_instrument,
                 Stream::new().aggregation(Aggregation::ExplicitBucketHistogram {
                     boundaries: Vec::from(Self::DEFAULT_HISTOGRAM_BOUNDARIES),
                     record_min_max: true,
@@ -210,13 +228,16 @@ impl CustomView {
 impl View for CustomView {
     fn match_inst(&self, inst: &Instrument) -> Option<Stream> {
         match (inst.kind, inst.name.as_ref()) {
+            (Some(InstrumentKind::Histogram), TRANSACTION_RETRIES_METER_NAME) => {
+                self.retries_histogram_view.match_inst(inst)
+            }
+            (Some(InstrumentKind::Histogram), AGGREGATED_REPORT_SHARE_DIMENSION_METER_NAME) => {
+                self.vdaf_dimension_histogram_view.match_inst(inst)
+            }
             (
                 Some(InstrumentKind::Histogram),
                 "http.server.request.body.size" | "http.server.response.body.size",
             ) => self.bytes_histogram_view.match_inst(inst),
-            (Some(InstrumentKind::Histogram), TRANSACTION_RETRIES_METER_NAME) => {
-                self.uint_histogram_view.match_inst(inst)
-            }
             (Some(InstrumentKind::Histogram), _) => self.default_histogram_view.match_inst(inst),
             _ => None,
         }
@@ -356,6 +377,7 @@ pub async fn install_metrics_exporter(
                 .with_view(CustomView::new()?)
                 .with_resource(resource())
                 .build();
+            set_meter_provider(meter_provider.clone());
             // We can't drop the PushController, as that would stop pushes, so return it to the
             // caller.
             Ok(MetricsExporterHandle::Otlp(meter_provider))
@@ -389,14 +411,26 @@ fn resource() -> Resource {
     version_info_resource.merge(&default_resource)
 }
 
+// TODO(#3165): This counter is made obsolete by the histogram below. Remove it once it is no longer
+// being used.
 pub(crate) fn report_aggregation_success_counter(meter: &Meter) -> Counter<u64> {
     let report_aggregation_success_counter = meter
         .u64_counter("janus_report_aggregation_success_counter")
         .with_description("Number of successfully-aggregated report shares")
-        .with_unit(Unit::new("{report}"))
+        .with_unit("{report}")
         .init();
     report_aggregation_success_counter.add(0, &[]);
     report_aggregation_success_counter
+}
+
+pub const AGGREGATED_REPORT_SHARE_DIMENSION_METER_NAME: &str =
+    "janus_aggregated_report_share_vdaf_dimension";
+
+pub(crate) fn aggregated_report_share_dimension_histogram(meter: &Meter) -> Histogram<u64> {
+    meter
+        .u64_histogram(AGGREGATED_REPORT_SHARE_DIMENSION_METER_NAME)
+        .with_description("Successfully aggregated report shares")
+        .init()
 }
 
 pub(crate) fn aggregate_step_failure_counter(meter: &Meter) -> Counter<u64> {
@@ -406,7 +440,7 @@ pub(crate) fn aggregate_step_failure_counter(meter: &Meter) -> Counter<u64> {
             "Failures while stepping aggregation jobs; these failures are ",
             "related to individual client reports rather than entire aggregation jobs."
         ))
-        .with_unit(Unit::new("{error}"))
+        .with_unit("{error}")
         .init();
 
     // Initialize counters with desired status labels. This causes Prometheus to see the first

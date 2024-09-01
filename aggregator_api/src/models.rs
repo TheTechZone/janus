@@ -1,7 +1,9 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use derivative::Derivative;
 use janus_aggregator_core::{
-    datastore::models::{GlobalHpkeKeypair, HpkeKeyState, TaskUploadCounter},
+    datastore::models::{
+        GlobalHpkeKeypair, HpkeKeyState, TaskAggregationCounter, TaskUploadCounter,
+    },
     task::{AggregatorTask, QueryType},
     taskprov::{PeerAggregator, VerifyKeyInit},
 };
@@ -35,6 +37,8 @@ pub(crate) struct AggregatorApiConfig {
     pub vdafs: Vec<SupportedVdaf>,
     pub query_types: Vec<SupportedQueryType>,
     pub features: &'static [&'static str],
+    pub software_name: &'static str,
+    pub software_version: &'static str,
 }
 
 #[allow(clippy::enum_variant_names)]
@@ -174,6 +178,9 @@ impl TryFrom<&AggregatorTask> for TaskResp {
 
 #[derive(Serialize)]
 pub(crate) struct GetTaskUploadMetricsResp(pub(crate) TaskUploadCounter);
+
+#[derive(Serialize)]
+pub(crate) struct GetTaskAggregationMetricsResp(pub(crate) TaskAggregationCounter);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct GlobalHpkeConfigResp {

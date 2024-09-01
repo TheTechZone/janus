@@ -8,6 +8,7 @@ use clap::Parser;
 use janus_core::{time::RealClock, TokioRuntime};
 use serde::{Deserialize, Serialize};
 use std::{fmt::Debug, sync::Arc, time::Duration};
+use tracing::info;
 
 pub async fn main_callback(ctx: BinaryContext<RealClock, Options, Config>) -> Result<()> {
     const CLIENT_USER_AGENT: &str = concat!(
@@ -22,12 +23,12 @@ pub async fn main_callback(ctx: BinaryContext<RealClock, Options, Config>) -> Re
         reqwest::Client::builder()
             .user_agent(CLIENT_USER_AGENT)
             .timeout(Duration::from_secs(
-                ctx.config.job_driver_config.http_request_timeout_secs,
+                ctx.config.job_driver_config.http_request_timeout_s,
             ))
             .connect_timeout(Duration::from_secs(
                 ctx.config
                     .job_driver_config
-                    .http_request_connection_timeout_secs,
+                    .http_request_connection_timeout_s,
             ))
             .build()
             .context("couldn't create HTTP client")?,
@@ -35,14 +36,13 @@ pub async fn main_callback(ctx: BinaryContext<RealClock, Options, Config>) -> Re
         &ctx.meter,
         ctx.config.batch_aggregation_shard_count,
         RetryStrategy::new(
-            Duration::from_secs(ctx.config.min_collection_job_retry_delay_secs),
-            Duration::from_secs(ctx.config.max_collection_job_retry_delay_secs),
+            Duration::from_secs(ctx.config.min_collection_job_retry_delay_s),
+            Duration::from_secs(ctx.config.max_collection_job_retry_delay_s),
             ctx.config.collection_job_retry_delay_exponential_factor,
         )
         .context("Couldn't create collection retry strategy")?,
     ));
-    let lease_duration =
-        Duration::from_secs(ctx.config.job_driver_config.worker_lease_duration_secs);
+    let lease_duration = Duration::from_secs(ctx.config.job_driver_config.worker_lease_duration_s);
 
     // Start running.
     let job_driver = Arc::new(JobDriver::new(
@@ -50,12 +50,12 @@ pub async fn main_callback(ctx: BinaryContext<RealClock, Options, Config>) -> Re
         TokioRuntime,
         ctx.meter,
         ctx.stopper,
-        Duration::from_secs(ctx.config.job_driver_config.job_discovery_interval_secs),
+        Duration::from_secs(ctx.config.job_driver_config.job_discovery_interval_s),
         ctx.config.job_driver_config.max_concurrent_job_workers,
         Duration::from_secs(
             ctx.config
                 .job_driver_config
-                .worker_lease_clock_skew_allowance_secs,
+                .worker_lease_clock_skew_allowance_s,
         ),
         collection_job_driver
             .make_incomplete_job_acquirer_callback(Arc::clone(&datastore), lease_duration),
@@ -64,6 +64,8 @@ pub async fn main_callback(ctx: BinaryContext<RealClock, Options, Config>) -> Re
             ctx.config.job_driver_config.maximum_attempts_before_failure,
         ),
     )?);
+
+    info!("Running collection job driver");
     job_driver.run().await;
 
     Ok(())
@@ -99,23 +101,25 @@ impl BinaryOptions for Options {
 ///   url: "postgres://postgres:postgres@localhost:5432/postgres"
 /// logging_config: # logging_config is optional
 ///   force_json_output: true
-/// job_discovery_interval_secs: 10
+/// job_discovery_interval_s: 10
 /// max_concurrent_job_workers: 10
-/// worker_lease_duration_secs: 600
-/// worker_lease_clock_skew_allowance_secs: 60
+/// worker_lease_duration_s: 600
+/// worker_lease_clock_skew_allowance_s: 60
 /// maximum_attempts_before_failure: 5
-/// retry_initial_interval_millis: 1000
-/// retry_max_interval_millis: 30000
-/// retry_max_elapsed_time_millis: 300000
+/// retry_initial_interval_ms: 1000
+/// retry_max_interval_ms: 30000
+/// retry_max_elapsed_time_ms: 300000
 /// batch_aggregation_shard_count: 32
-/// min_collection_job_retry_delay_secs: 600
-/// max_collection_job_retry_delay_secs: 3600
+/// min_collection_job_retry_delay_s: 600
+/// max_collection_job_retry_delay_s: 3600
 /// collection_job_retry_delay_exponential_factor: 1.25
 /// "#;
 ///
 /// let _decoded: Config = serde_yaml::from_str(yaml_config).unwrap();
 /// ```
+// TODO(#3293): remove aliases during next breaking changes window.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(flatten)]
     pub common_config: CommonConfig,
@@ -129,13 +133,19 @@ pub struct Config {
 
     /// The minimum duration to wait, in seconds, before retrying a collection job that has been
     /// stepped but was not ready yet because not all included reports had finished aggregation.
-    #[serde(default = "Config::default_min_collection_job_retry_delay_secs")]
-    pub min_collection_job_retry_delay_secs: u64,
+    #[serde(
+        default = "Config::default_min_collection_job_retry_delay_s",
+        alias = "min_collection_job_retry_delay_secs"
+    )]
+    pub min_collection_job_retry_delay_s: u64,
 
     /// The maximum duration to wait, in seconds, before retrying a collection job that has been
     /// stepped but was not ready yet because not all included reports had finished aggregation.
-    #[serde(default = "Config::default_max_collection_job_retry_delay_secs")]
-    pub max_collection_job_retry_delay_secs: u64,
+    #[serde(
+        default = "Config::default_max_collection_job_retry_delay_s",
+        alias = "max_collection_job_retry_delay_secs"
+    )]
+    pub max_collection_job_retry_delay_s: u64,
 
     /// The exponential factor to use when computing a retry delay when retrying a collection job
     /// that has been stepped but was not ready yet because not all included reports had finished
@@ -145,11 +155,11 @@ pub struct Config {
 }
 
 impl Config {
-    fn default_min_collection_job_retry_delay_secs() -> u64 {
+    fn default_min_collection_job_retry_delay_s() -> u64 {
         600
     }
 
-    fn default_max_collection_job_retry_delay_secs() -> u64 {
+    fn default_max_collection_job_retry_delay_s() -> u64 {
         3600
     }
 
@@ -196,20 +206,20 @@ mod tests {
                 max_transaction_retries: default_max_transaction_retries(),
             },
             job_driver_config: JobDriverConfig {
-                job_discovery_interval_secs: 10,
+                job_discovery_interval_s: 10,
                 max_concurrent_job_workers: 10,
-                worker_lease_duration_secs: 600,
-                worker_lease_clock_skew_allowance_secs: 60,
+                worker_lease_duration_s: 600,
+                worker_lease_clock_skew_allowance_s: 60,
                 maximum_attempts_before_failure: 5,
-                http_request_timeout_secs: 10,
-                http_request_connection_timeout_secs: 30,
-                retry_initial_interval_millis: 1000,
-                retry_max_interval_millis: 30_000,
-                retry_max_elapsed_time_millis: 300_000,
+                http_request_timeout_s: 10,
+                http_request_connection_timeout_s: 30,
+                retry_initial_interval_ms: 1000,
+                retry_max_interval_ms: 30_000,
+                retry_max_elapsed_time_ms: 300_000,
             },
             batch_aggregation_shard_count: 32,
-            min_collection_job_retry_delay_secs: 600,
-            max_collection_job_retry_delay_secs: 3600,
+            min_collection_job_retry_delay_s: 600,
+            max_collection_job_retry_delay_s: 3600,
             collection_job_retry_delay_exponential_factor: 1.25,
         })
     }

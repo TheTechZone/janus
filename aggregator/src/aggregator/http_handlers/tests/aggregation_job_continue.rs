@@ -3,15 +3,17 @@ use crate::aggregator::{
         post_aggregation_job_and_decode, post_aggregation_job_expecting_error,
     },
     empty_batch_aggregations,
-    http_handlers::test_util::setup_http_handler_test,
-    test_util::BATCH_AGGREGATION_SHARD_COUNT,
-    tests::generate_helper_report_share,
+    http_handlers::test_util::HttpHandlerTest,
+    test_util::{
+        assert_task_aggregation_counter, generate_helper_report_share,
+        BATCH_AGGREGATION_SHARD_COUNT,
+    },
 };
 use futures::future::try_join_all;
 use janus_aggregator_core::{
     datastore::models::{
         merge_batch_aggregations_by_batch, AggregationJob, AggregationJobState, BatchAggregation,
-        BatchAggregationState, ReportAggregation, ReportAggregationState,
+        BatchAggregationState, ReportAggregation, ReportAggregationState, TaskAggregationCounter,
     },
     query_type::CollectableQueryType,
     task::{test_util::TaskBuilder, QueryType, VerifyKey},
@@ -43,7 +45,14 @@ use trillium::Status;
 
 #[tokio::test]
 async fn aggregate_continue() {
-    let (clock, _ephemeral_datastore, datastore, handler) = setup_http_handler_test().await;
+    let HttpHandlerTest {
+        clock,
+        ephemeral_datastore: _ephemeral_datastore,
+        datastore,
+        handler,
+        hpke_keypair: hpke_key,
+        ..
+    } = HttpHandlerTest::new().await;
 
     let aggregation_job_id = random();
     let task = TaskBuilder::new(QueryType::TimeInterval, VdafInstance::Poplar1 { bits: 1 }).build();
@@ -51,7 +60,6 @@ async fn aggregate_continue() {
 
     let vdaf = Arc::new(Poplar1::<XofTurboShake128, 16>::new(1));
     let verify_key: VerifyKey<VERIFY_KEY_LENGTH> = task.vdaf_verify_key().unwrap();
-    let hpke_key = helper_task.current_hpke_key();
     let measurement = IdpfInput::from_bools(&[true]);
     let aggregation_param =
         Poplar1AggregationParam::try_from_prefixes(vec![measurement.clone()]).unwrap();
@@ -367,11 +375,24 @@ async fn aggregate_continue() {
             )
         ])
     );
+
+    assert_task_aggregation_counter(
+        &datastore,
+        *task.id(),
+        TaskAggregationCounter::new_with_values(1),
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn aggregate_continue_accumulate_batch_aggregation() {
-    let (_, _ephemeral_datastore, datastore, handler) = setup_http_handler_test().await;
+    let HttpHandlerTest {
+        ephemeral_datastore: _ephemeral_datastore,
+        datastore,
+        handler,
+        hpke_keypair: hpke_key,
+        ..
+    } = HttpHandlerTest::new().await;
 
     let task = TaskBuilder::new(QueryType::TimeInterval, VdafInstance::Poplar1 { bits: 1 }).build();
     let helper_task = task.helper_view().unwrap();
@@ -387,10 +408,9 @@ async fn aggregate_continue_accumulate_batch_aggregation() {
 
     let vdaf = Poplar1::new(1);
     let verify_key: VerifyKey<VERIFY_KEY_LENGTH> = task.vdaf_verify_key().unwrap();
-    let hpke_key = helper_task.current_hpke_key();
     let measurement = IdpfInput::from_bools(&[true]);
     let aggregation_param =
-        Poplar1AggregationParam::try_from_prefixes(vec![measurement.clone()]).unwrap();
+        Poplar1AggregationParam::try_from_prefixes(Vec::from([measurement.clone()])).unwrap();
 
     // report_share_0 is a "happy path" report.
     let report_time_0 = first_batch_interval_clock
@@ -661,12 +681,10 @@ async fn aggregate_continue_accumulate_batch_aggregation() {
     // Map the batch aggregation ordinal value to 0, as it may vary due to sharding.
     let first_batch_got_batch_aggregations = datastore
         .run_unnamed_tx(|tx| {
-            let (task, vdaf, report_metadata_0, aggregation_param) = (
-                helper_task.clone(),
-                vdaf.clone(),
-                report_metadata_0.clone(),
-                aggregation_param.clone(),
-            );
+            let task = helper_task.clone();
+            let vdaf = vdaf.clone();
+            let aggregation_param = aggregation_param.clone();
+
             Box::pin(async move {
                 Ok(merge_batch_aggregations_by_batch(
                     TimeInterval::get_batch_aggregations_for_collection_identifier::<
@@ -678,14 +696,7 @@ async fn aggregate_continue_accumulate_batch_aggregation() {
                         task.id(),
                         task.time_precision(),
                         &vdaf,
-                        &Interval::new(
-                            report_metadata_0
-                                .time()
-                                .to_batch_interval_start(task.time_precision())
-                                .unwrap(),
-                            *task.time_precision(),
-                        )
-                        .unwrap(),
+                        &first_batch_identifier,
                         &aggregation_param,
                     )
                     .await
@@ -728,33 +739,28 @@ async fn aggregate_continue_accumulate_batch_aggregation() {
 
     let second_batch_got_batch_aggregations = datastore
         .run_unnamed_tx(|tx| {
-            let (task, vdaf, report_metadata_2, aggregation_param) = (
-                helper_task.clone(),
-                vdaf.clone(),
-                report_metadata_2.clone(),
-                aggregation_param.clone(),
-            );
+            let task = helper_task.clone();
+            let vdaf = vdaf.clone();
+            let aggregation_param = aggregation_param.clone();
+
             Box::pin(async move {
-                TimeInterval::get_batch_aggregations_for_collection_identifier::<
-                    VERIFY_KEY_LENGTH,
-                    Poplar1<XofTurboShake128, 16>,
-                    _,
-                >(
-                    tx,
-                    task.id(),
-                    task.time_precision(),
-                    &vdaf,
-                    &Interval::new(
-                        report_metadata_2
-                            .time()
-                            .to_batch_interval_start(task.time_precision())
-                            .unwrap(),
-                        Duration::from_seconds(task.time_precision().as_seconds()),
+                let mut got_batch_aggregations =
+                    TimeInterval::get_batch_aggregations_for_collection_identifier::<
+                        VERIFY_KEY_LENGTH,
+                        Poplar1<XofTurboShake128, 16>,
+                        _,
+                    >(
+                        tx,
+                        task.id(),
+                        task.time_precision(),
+                        &vdaf,
+                        &second_batch_identifier,
+                        &aggregation_param,
                     )
-                    .unwrap(),
-                    &aggregation_param,
-                )
-                .await
+                    .await
+                    .unwrap();
+                got_batch_aggregations.sort_unstable_by_key(|ba| ba.ord());
+                Ok(got_batch_aggregations)
             })
         })
         .await
@@ -763,6 +769,13 @@ async fn aggregate_continue_accumulate_batch_aggregation() {
         second_batch_got_batch_aggregations,
         second_batch_want_batch_aggregations
     );
+
+    assert_task_aggregation_counter(
+        &datastore,
+        *task.id(),
+        TaskAggregationCounter::new_with_values(2),
+    )
+    .await;
 
     // Aggregate some more reports, which should get accumulated into the batch_aggregations
     // rows created earlier.
@@ -963,12 +976,10 @@ async fn aggregate_continue_accumulate_batch_aggregation() {
     // be the same)
     let first_batch_got_batch_aggregations = datastore
         .run_unnamed_tx(|tx| {
-            let (task, vdaf, report_metadata_0, aggregation_param) = (
-                helper_task.clone(),
-                vdaf.clone(),
-                report_metadata_0.clone(),
-                aggregation_param.clone(),
-            );
+            let task = helper_task.clone();
+            let vdaf = vdaf.clone();
+            let aggregation_param = aggregation_param.clone();
+
             Box::pin(async move {
                 Ok(merge_batch_aggregations_by_batch(
                     TimeInterval::get_batch_aggregations_for_collection_identifier::<
@@ -980,14 +991,7 @@ async fn aggregate_continue_accumulate_batch_aggregation() {
                         task.id(),
                         task.time_precision(),
                         &vdaf,
-                        &Interval::new(
-                            report_metadata_0
-                                .time()
-                                .to_batch_interval_start(task.time_precision())
-                                .unwrap(),
-                            Duration::from_seconds(task.time_precision().as_seconds()),
-                        )
-                        .unwrap(),
+                        &first_batch_identifier,
                         &aggregation_param,
                     )
                     .await
@@ -1019,14 +1023,7 @@ async fn aggregate_continue_accumulate_batch_aggregation() {
         first_batch_got_batch_aggregations,
         Vec::from([BatchAggregation::new(
             *task.id(),
-            Interval::new(
-                report_metadata_0
-                    .time()
-                    .to_batch_interval_start(task.time_precision())
-                    .unwrap(),
-                *task.time_precision()
-            )
-            .unwrap(),
+            first_batch_identifier,
             aggregation_param.clone(),
             0,
             first_batch_interval,
@@ -1042,33 +1039,28 @@ async fn aggregate_continue_accumulate_batch_aggregation() {
 
     let second_batch_got_batch_aggregations = datastore
         .run_unnamed_tx(|tx| {
-            let (task, vdaf, report_metadata_2, aggregation_param) = (
-                helper_task.clone(),
-                vdaf.clone(),
-                report_metadata_2.clone(),
-                aggregation_param.clone(),
-            );
+            let task = helper_task.clone();
+            let vdaf = vdaf.clone();
+            let aggregation_param = aggregation_param.clone();
+
             Box::pin(async move {
-                TimeInterval::get_batch_aggregations_for_collection_identifier::<
-                    VERIFY_KEY_LENGTH,
-                    Poplar1<XofTurboShake128, 16>,
-                    _,
-                >(
-                    tx,
-                    task.id(),
-                    task.time_precision(),
-                    &vdaf,
-                    &Interval::new(
-                        report_metadata_2
-                            .time()
-                            .to_batch_interval_start(task.time_precision())
-                            .unwrap(),
-                        Duration::from_seconds(task.time_precision().as_seconds()),
+                let mut got_batch_aggregations =
+                    TimeInterval::get_batch_aggregations_for_collection_identifier::<
+                        VERIFY_KEY_LENGTH,
+                        Poplar1<XofTurboShake128, 16>,
+                        _,
+                    >(
+                        tx,
+                        task.id(),
+                        task.time_precision(),
+                        &vdaf,
+                        &second_batch_identifier,
+                        &aggregation_param,
                     )
-                    .unwrap(),
-                    &aggregation_param,
-                )
-                .await
+                    .await
+                    .unwrap();
+                got_batch_aggregations.sort_unstable_by_key(|ba| ba.ord());
+                Ok(got_batch_aggregations)
             })
         })
         .await
@@ -1077,11 +1069,23 @@ async fn aggregate_continue_accumulate_batch_aggregation() {
         second_batch_got_batch_aggregations,
         second_batch_want_batch_aggregations
     );
+
+    assert_task_aggregation_counter(
+        &datastore,
+        *task.id(),
+        TaskAggregationCounter::new_with_values(3),
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn aggregate_continue_leader_sends_non_continue_or_finish_transition() {
-    let (_, _ephemeral_datastore, datastore, handler) = setup_http_handler_test().await;
+    let HttpHandlerTest {
+        ephemeral_datastore: _ephemeral_datastore,
+        datastore,
+        handler,
+        ..
+    } = HttpHandlerTest::new().await;
 
     // Prepare parameters.
     let task = TaskBuilder::new(QueryType::TimeInterval, VdafInstance::Poplar1 { bits: 1 }).build();
@@ -1188,11 +1192,24 @@ async fn aggregate_continue_leader_sends_non_continue_or_finish_transition() {
             PrepareStepResult::Reject(PrepareError::VdafPrepError),
         )
     );
+
+    assert_task_aggregation_counter(
+        &datastore,
+        *task.id(),
+        TaskAggregationCounter::new_with_values(0),
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn aggregate_continue_prep_step_fails() {
-    let (_, _ephemeral_datastore, datastore, handler) = setup_http_handler_test().await;
+    let HttpHandlerTest {
+        ephemeral_datastore: _ephemeral_datastore,
+        datastore,
+        handler,
+        hpke_keypair: hpke_key,
+        ..
+    } = HttpHandlerTest::new().await;
 
     // Prepare parameters.
     let task = TaskBuilder::new(QueryType::TimeInterval, VdafInstance::Poplar1 { bits: 1 }).build();
@@ -1214,7 +1231,7 @@ async fn aggregate_continue_prep_step_fails() {
     let helper_report_share = generate_helper_report_share::<Poplar1<XofTurboShake128, 16>>(
         *task.id(),
         report_metadata.clone(),
-        helper_task.current_hpke_key().config(),
+        hpke_key.config(),
         &transcript.public_share,
         Vec::new(),
         &transcript.helper_input_share,
@@ -1356,11 +1373,23 @@ async fn aggregate_continue_prep_step_fails() {
             },
         )
     );
+
+    assert_task_aggregation_counter(
+        &datastore,
+        *task.id(),
+        TaskAggregationCounter::new_with_values(0),
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn aggregate_continue_unexpected_transition() {
-    let (_, _ephemeral_datastore, datastore, handler) = setup_http_handler_test().await;
+    let HttpHandlerTest {
+        ephemeral_datastore: _ephemeral_datastore,
+        datastore,
+        handler,
+        ..
+    } = HttpHandlerTest::new().await;
 
     // Prepare parameters.
     let task = TaskBuilder::new(QueryType::TimeInterval, VdafInstance::Poplar1 { bits: 1 }).build();
@@ -1467,11 +1496,23 @@ async fn aggregate_continue_unexpected_transition() {
         None,
     )
     .await;
+
+    assert_task_aggregation_counter(
+        &datastore,
+        *task.id(),
+        TaskAggregationCounter::new_with_values(0),
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn aggregate_continue_out_of_order_transition() {
-    let (_, _ephemeral_datastore, datastore, handler) = setup_http_handler_test().await;
+    let HttpHandlerTest {
+        ephemeral_datastore: _ephemeral_datastore,
+        datastore,
+        handler,
+        ..
+    } = HttpHandlerTest::new().await;
 
     // Prepare parameters.
     let task = TaskBuilder::new(QueryType::TimeInterval, VdafInstance::Poplar1 { bits: 1 }).build();
@@ -1637,11 +1678,23 @@ async fn aggregate_continue_out_of_order_transition() {
         None,
     )
     .await;
+
+    assert_task_aggregation_counter(
+        &datastore,
+        *task.id(),
+        TaskAggregationCounter::new_with_values(0),
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn aggregate_continue_for_non_waiting_aggregation() {
-    let (_, _ephemeral_datastore, datastore, handler) = setup_http_handler_test().await;
+    let HttpHandlerTest {
+        ephemeral_datastore: _ephemeral_datastore,
+        datastore,
+        handler,
+        ..
+    } = HttpHandlerTest::new().await;
 
     // Prepare parameters.
     let task = TaskBuilder::new(QueryType::TimeInterval, VdafInstance::Fake { rounds: 1 }).build();
@@ -1721,6 +1774,13 @@ async fn aggregate_continue_for_non_waiting_aggregation() {
         "urn:ietf:params:ppm:dap:error:invalidMessage",
         "The message type for a response was incorrect or the payload was malformed.",
         None,
+    )
+    .await;
+
+    assert_task_aggregation_counter(
+        &datastore,
+        *task.id(),
+        TaskAggregationCounter::new_with_values(0),
     )
     .await;
 }

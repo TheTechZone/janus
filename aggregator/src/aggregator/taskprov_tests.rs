@@ -15,7 +15,7 @@ use janus_aggregator_core::{
     datastore::{
         models::{
             AggregateShareJob, AggregationJob, AggregationJobState, BatchAggregation,
-            BatchAggregationState, ReportAggregation, ReportAggregationState,
+            BatchAggregationState, HpkeKeyState, ReportAggregation, ReportAggregationState,
         },
         test_util::{ephemeral_datastore, EphemeralDatastore},
         Datastore,
@@ -28,10 +28,7 @@ use janus_aggregator_core::{
     test_util::noop_meter,
 };
 use janus_core::{
-    hpke::{
-        self, test_util::generate_test_hpke_config_and_private_key, HpkeApplicationInfo,
-        HpkeKeypair, Label,
-    },
+    hpke::{self, HpkeApplicationInfo, HpkeKeypair, Label},
     report_id::ReportIdChecksumExt,
     taskprov::TASKPROV_HEADER,
     test_util::{install_test_trace_subscriber, runtime::TestRuntime, VdafTranscript},
@@ -124,8 +121,8 @@ where
         let ephemeral_datastore = ephemeral_datastore().await;
         let datastore = Arc::new(ephemeral_datastore.datastore(clock.clone()).await);
 
-        let global_hpke_key = generate_test_hpke_config_and_private_key();
-        let collector_hpke_keypair = generate_test_hpke_config_and_private_key();
+        let global_hpke_key = HpkeKeypair::test();
+        let collector_hpke_keypair = HpkeKeypair::test();
         let peer_aggregator = PeerAggregatorBuilder::new()
             .with_endpoint(url::Url::parse("https://leader.example.com/").unwrap())
             .with_role(Role::Leader)
@@ -138,6 +135,12 @@ where
                 let peer_aggregator = peer_aggregator.clone();
                 Box::pin(async move {
                     tx.put_global_hpke_keypair(&global_hpke_key).await.unwrap();
+                    tx.set_global_hpke_keypair_state(
+                        global_hpke_key.config().id(),
+                        &HpkeKeyState::Active,
+                    )
+                    .await
+                    .unwrap();
                     tx.put_taskprov_peer_aggregator(&peer_aggregator)
                         .await
                         .unwrap();
@@ -250,10 +253,10 @@ where
         let (report_share, transcript) = PrepareInitGenerator::new(
             self.clock.clone(),
             self.task.helper_view().unwrap(),
+            self.global_hpke_key.config().clone(),
             self.vdaf.clone(),
             self.aggregation_param.clone(),
         )
-        .with_hpke_config(self.global_hpke_key.config().clone())
         .with_extensions(extensions)
         .next_report_share(&self.measurement);
         (transcript, report_share, self.aggregation_param.clone())

@@ -9,22 +9,28 @@ use janus_aggregator_core::{
         models::{
             AggregationJob, AggregationJobState, BatchAggregation, BatchAggregationState,
             ReportAggregation, ReportAggregationMetadata, ReportAggregationMetadataState,
-            ReportAggregationState,
+            ReportAggregationState, TaskAggregationCounter,
         },
         Error, Transaction,
     },
     query_type::AccumulableQueryType,
     task::AggregatorTask,
 };
+#[cfg(feature = "fpvec_bounded_l2")]
+use janus_core::vdaf::Prio3FixedPointBoundedL2VecSumBitSize;
 use janus_core::{
     report_id::ReportIdChecksumExt as _,
     time::{Clock, IntervalExt},
+    vdaf::VdafInstance,
 };
 use janus_messages::{
     AggregationJobId, Interval, PrepareError, PrepareResp, PrepareStepResult, ReportId,
     ReportIdChecksum, Time,
 };
-use opentelemetry::{metrics::Counter, KeyValue};
+use opentelemetry::{
+    metrics::{Counter, Histogram},
+    KeyValue,
+};
 use prio::{codec::Encode, vdaf};
 use rand::{thread_rng, Rng as _};
 use std::{borrow::Cow, collections::HashMap, marker::PhantomData, sync::Arc};
@@ -52,6 +58,7 @@ where
 pub struct AggregationJobWriterMetrics {
     pub report_aggregation_success_counter: Counter<u64>,
     pub aggregate_step_failure_counter: Counter<u64>,
+    pub aggregated_report_share_dimension_histogram: Histogram<u64>,
 }
 
 #[allow(private_bounds)]
@@ -167,7 +174,8 @@ where
     /// will be written with a `Failed(BatchCollected)` state.
     ///
     /// A map from aggregation job ID to the associated preparation responses (if any) will be
-    /// returned. In the case that a report aggregation was unaggregatable, these preparation
+    /// returned, along with aggregation counters indicating occurrences of aggregation-related
+    /// events. In the case that a report aggregation was unaggregatable, these preparation
     /// responses will be updated from the preparation responses originally included in the given
     /// report aggregations.
     #[tracing::instrument(
@@ -179,7 +187,13 @@ where
         &self,
         tx: &Transaction<'_, C>,
         vdaf: Arc<A>,
-    ) -> Result<HashMap<AggregationJobId, Vec<PrepareResp>>, Error>
+    ) -> Result<
+        (
+            HashMap<AggregationJobId, Vec<PrepareResp>>,
+            TaskAggregationCounter,
+        ),
+        Error,
+    >
     where
         C: Clock,
         A: Send + Sync,
@@ -235,22 +249,25 @@ where
             }));
         try_join!(write_agg_jobs_future, write_batch_aggs_future)?;
 
-        Ok(state
-            .by_aggregation_job
-            .into_iter()
-            .map(|(agg_job_id, agg_job_info)| {
-                (
-                    agg_job_id,
-                    agg_job_info
-                        .report_aggregations
-                        .iter()
-                        .map(AsRef::as_ref)
-                        .filter_map(RA::last_prep_resp)
-                        .cloned()
-                        .collect(),
-                )
-            })
-            .collect())
+        Ok((
+            state
+                .by_aggregation_job
+                .into_iter()
+                .map(|(agg_job_id, agg_job_info)| {
+                    (
+                        agg_job_id,
+                        agg_job_info
+                            .report_aggregations
+                            .iter()
+                            .map(AsRef::as_ref)
+                            .filter_map(RA::Borrowed::last_prep_resp)
+                            .cloned()
+                            .collect(),
+                    )
+                })
+                .collect(),
+            state.counters,
+        ))
     }
 
     fn update_metrics<F: FnOnce(&AggregationJobWriterMetrics)>(&self, f: F) {
@@ -424,6 +441,7 @@ where
     batch_aggregation_ord: u64,
     by_aggregation_job: HashMap<AggregationJobId, CowAggregationJobInfo<'a, SEED_SIZE, Q, A, RA>>,
     batch_aggregations: HashMap<Q::BatchIdentifier, (Operation, BatchAggregation<SEED_SIZE, Q, A>)>,
+    counters: TaskAggregationCounter,
 }
 
 /// An aggregation job and its accompanying report aggregations.
@@ -445,7 +463,7 @@ where
     RA: ReportAggregationUpdate<SEED_SIZE, A>,
 {
     aggregation_job: Cow<'a, AggregationJob<SEED_SIZE, Q, A>>,
-    report_aggregations: Vec<Cow<'a, RA>>,
+    report_aggregations: Vec<Cow<'a, RA::Borrowed>>,
 }
 
 impl<'a, const SEED_SIZE: usize, Q, A, WT, RA> WriteState<'a, SEED_SIZE, Q, A, WT, RA>
@@ -473,8 +491,9 @@ where
                 return Ok(Self {
                     writer,
                     batch_aggregation_ord: 0,
-                    by_aggregation_job: HashMap::new(),
-                    batch_aggregations: HashMap::new(),
+                    by_aggregation_job: HashMap::default(),
+                    batch_aggregations: HashMap::default(),
+                    counters: TaskAggregationCounter::default(),
                 });
             }
         };
@@ -500,7 +519,7 @@ where
                             aggregation_job: Cow::Borrowed(aggregation_job),
                             report_aggregations: report_aggregations
                                 .iter()
-                                .map(Cow::Borrowed)
+                                .map(RA::borrow)
                                 .collect::<Vec<_>>(),
                         },
                     )
@@ -534,6 +553,7 @@ where
             batch_aggregation_ord,
             by_aggregation_job,
             batch_aggregations,
+            counters: TaskAggregationCounter::default(),
         })
     }
 
@@ -643,6 +663,7 @@ where
                         .get_mut(*ra_idx)
                         .unwrap();
 
+                    let mut is_finished = false;
                     let ra_batch_aggregation = BatchAggregation::new(
                         *self.writer.task.id(),
                         batch_identifier.clone(),
@@ -650,6 +671,7 @@ where
                         self.batch_aggregation_ord,
                         Interval::from_time(report_aggregation.time())?,
                         if let Some(output_share) = report_aggregation.is_finished() {
+                            is_finished = true;
                             BatchAggregationState::Aggregating {
                                 aggregate_share: Some(output_share.clone().into()),
                                 report_count: 1,
@@ -672,13 +694,134 @@ where
 
                     match ra_batch_aggregation.merged_with(batch_aggregation) {
                         Ok(merged_batch_aggregation) => {
-                            self.writer.update_metrics(|metrics| {
-                                metrics.report_aggregation_success_counter.add(1, &[])
-                            });
+                            if is_finished {
+                                self.counters.increment_success();
+                                self.writer.update_metrics(|metrics| {
+                                    metrics.report_aggregation_success_counter.add(1, &[]);
+
+                                    use VdafInstance::*;
+                                    match self.writer.task.vdaf() {
+                                        Prio3Count => metrics
+                                            .aggregated_report_share_dimension_histogram
+                                            .record(1, &[KeyValue::new("type", "Prio3Count")]),
+
+                                        Prio3Sum { bits } => metrics
+                                            .aggregated_report_share_dimension_histogram
+                                            .record(
+                                                u64::try_from(*bits).unwrap_or(u64::MAX),
+                                                &[KeyValue::new("type", "Prio3Sum")],
+                                            ),
+
+                                        Prio3SumVec {
+                                            bits,
+                                            length,
+                                            chunk_length: _,
+                                            dp_strategy: _,
+                                        } => metrics
+                                            .aggregated_report_share_dimension_histogram
+                                            .record(
+                                                u64::try_from(*bits)
+                                                    .unwrap_or(u64::MAX)
+                                                    .saturating_mul(
+                                                        u64::try_from(*length).unwrap_or(u64::MAX),
+                                                    ),
+                                                &[KeyValue::new("type", "Prio3SumVec")],
+                                            ),
+
+                                        Prio3SumVecField64MultiproofHmacSha256Aes128 {
+                                            proofs: _,
+                                            bits,
+                                            length,
+                                            chunk_length: _,
+                                            dp_strategy: _,
+                                        } => metrics
+                                            .aggregated_report_share_dimension_histogram
+                                            .record(
+                                                u64::try_from(*bits)
+                                                    .unwrap_or(u64::MAX)
+                                                    .saturating_mul(
+                                                        u64::try_from(*length).unwrap_or(u64::MAX),
+                                                    ),
+                                                &[KeyValue::new(
+                                                    "type",
+                                                    "Prio3SumVecField64MultiproofHmacSha256Aes128",
+                                                )],
+                                            ),
+
+                                        Prio3Histogram {
+                                            length,
+                                            chunk_length: _,
+                                            dp_strategy: _,
+                                        } => metrics
+                                            .aggregated_report_share_dimension_histogram
+                                            .record(
+                                                u64::try_from(*length).unwrap_or(u64::MAX),
+                                                &[KeyValue::new("type", "Prio3Histogram")],
+                                            ),
+
+                                        #[cfg(feature = "fpvec_bounded_l2")]
+                                        Prio3FixedPointBoundedL2VecSum {
+                                            bitsize:
+                                                Prio3FixedPointBoundedL2VecSumBitSize::BitSize16,
+                                            dp_strategy: _,
+                                            length,
+                                        } => metrics
+                                            .aggregated_report_share_dimension_histogram
+                                            .record(
+                                                u64::try_from(*length)
+                                                    .unwrap_or(u64::MAX)
+                                                    .saturating_mul(16),
+                                                &[KeyValue::new(
+                                                    "type",
+                                                    "Prio3FixedPointBoundedL2VecSum",
+                                                )],
+                                            ),
+
+                                        #[cfg(feature = "fpvec_bounded_l2")]
+                                        Prio3FixedPointBoundedL2VecSum {
+                                            bitsize:
+                                                Prio3FixedPointBoundedL2VecSumBitSize::BitSize32,
+                                            dp_strategy: _,
+                                            length,
+                                        } => metrics
+                                            .aggregated_report_share_dimension_histogram
+                                            .record(
+                                                u64::try_from(*length)
+                                                    .unwrap_or(u64::MAX)
+                                                    .saturating_mul(32),
+                                                &[KeyValue::new(
+                                                    "type",
+                                                    "Prio3FixedPointBoundedL2VecSum",
+                                                )],
+                                            ),
+
+                                        Poplar1 { bits } => metrics
+                                            .aggregated_report_share_dimension_histogram
+                                            .record(
+                                                u64::try_from(*bits).unwrap_or(u64::MAX),
+                                                &[KeyValue::new("type", "Poplar1")],
+                                            ),
+
+                                        #[cfg(feature = "test-util")]
+                                        Fake { rounds: _ }
+                                        | FakeFailsPrepInit
+                                        | FakeFailsPrepStep => metrics
+                                            .aggregated_report_share_dimension_histogram
+                                            .record(0, &[KeyValue::new("type", "Fake")]),
+                                        _ => metrics
+                                            .aggregated_report_share_dimension_histogram
+                                            .record(0, &[KeyValue::new("type", "unknown")]),
+                                    }
+                                });
+                            }
                             *batch_aggregation = merged_batch_aggregation
                         }
                         Err(err) => {
-                            warn!(report_id = %report_aggregation.report_id(), ?err, "Couldn't update batch aggregation");
+                            warn!(
+                                report_id = %report_aggregation.report_id(),
+                                ?err,
+                                "Couldn't update batch aggregation",
+                            );
                             self.writer.update_metrics(|metrics| {
                                 metrics
                                     .aggregate_step_failure_counter
@@ -819,6 +962,8 @@ impl<const SEED_SIZE: usize, A: vdaf::Aggregator<SEED_SIZE, 16>>
 pub trait ReportAggregationUpdate<const SEED_SIZE: usize, A: vdaf::Aggregator<SEED_SIZE, 16>>:
     Clone + Send + Sync
 {
+    type Borrowed: ReportAggregationUpdate<SEED_SIZE, A>;
+
     /// Returns the order of this report aggregation in its aggregation job.
     fn ord(&self) -> u64;
 
@@ -850,6 +995,9 @@ pub trait ReportAggregationUpdate<const SEED_SIZE: usize, A: vdaf::Aggregator<SE
     /// existing report aggregations.
     async fn write_update(&self, tx: &Transaction<impl Clock>) -> Result<(), Error>;
 
+    /// Returns a borrowed `Cow` referring to this report aggregation.
+    fn borrow(&self) -> Cow<'_, Self::Borrowed>;
+
     /// Returns whether this report aggregation is in a terminal state ("Finished" or "Failed").
     fn is_terminal(&self) -> bool {
         self.is_finished().is_some() || self.is_failed()
@@ -867,6 +1015,8 @@ where
     A::PrepareMessage: Send + Sync,
     A::PublicShare: Send + Sync,
 {
+    type Borrowed = Self;
+
     fn ord(&self) -> u64 {
         self.report_aggregation.ord()
     }
@@ -924,6 +1074,10 @@ where
     async fn write_update(&self, tx: &Transaction<impl Clock>) -> Result<(), Error> {
         tx.update_report_aggregation(&self.report_aggregation).await
     }
+
+    fn borrow(&self) -> Cow<'_, Self::Borrowed> {
+        Cow::Borrowed(self)
+    }
 }
 
 #[async_trait]
@@ -931,6 +1085,8 @@ impl<const SEED_SIZE: usize, A> ReportAggregationUpdate<SEED_SIZE, A> for Report
 where
     A: vdaf::Aggregator<SEED_SIZE, 16>,
 {
+    type Borrowed = Self;
+
     fn ord(&self) -> u64 {
         self.ord()
     }
@@ -966,5 +1122,61 @@ where
 
     async fn write_update(&self, _tx: &Transaction<impl Clock>) -> Result<(), Error> {
         panic!("tried to update an existing report aggregation via ReportAggregationMetadata")
+    }
+
+    fn borrow(&self) -> Cow<'_, Self::Borrowed> {
+        Cow::Borrowed(self)
+    }
+}
+
+#[async_trait]
+impl<const SEED_SIZE: usize, A, RA> ReportAggregationUpdate<SEED_SIZE, A> for Cow<'_, RA>
+where
+    A: vdaf::Aggregator<SEED_SIZE, 16>,
+    RA: ReportAggregationUpdate<SEED_SIZE, A>,
+{
+    // All methods are implemented as a fallthrough to the implementation in `RA`.
+    type Borrowed = RA::Borrowed;
+
+    fn ord(&self) -> u64 {
+        self.as_ref().ord()
+    }
+
+    fn report_id(&self) -> &ReportId {
+        self.as_ref().report_id()
+    }
+
+    fn time(&self) -> &Time {
+        self.as_ref().time()
+    }
+
+    fn is_finished(&self) -> Option<&A::OutputShare> {
+        self.as_ref().is_finished()
+    }
+
+    fn is_failed(&self) -> bool {
+        self.as_ref().is_failed()
+    }
+
+    fn with_failure(self, prepare_error: PrepareError) -> Self {
+        // Since `with_failure` consumes the caller, we must own the CoW.
+        Self::Owned(self.into_owned().with_failure(prepare_error))
+    }
+
+    /// Returns the last preparation response from this report aggregation, if any.
+    fn last_prep_resp(&self) -> Option<&PrepareResp> {
+        self.as_ref().last_prep_resp()
+    }
+
+    async fn write_new(&self, tx: &Transaction<impl Clock>) -> Result<(), Error> {
+        self.as_ref().write_new(tx).await
+    }
+
+    async fn write_update(&self, tx: &Transaction<impl Clock>) -> Result<(), Error> {
+        self.as_ref().write_update(tx).await
+    }
+
+    fn borrow(&self) -> Cow<'_, RA::Borrowed> {
+        self.as_ref().borrow()
     }
 }

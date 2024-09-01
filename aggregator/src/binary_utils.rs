@@ -4,7 +4,6 @@ pub mod job_driver;
 
 use crate::{
     config::{BinaryConfig, DbConfig},
-    git_revision,
     metrics::install_metrics_exporter,
     trace::{install_trace_subscriber, TraceReloadHandle},
 };
@@ -15,6 +14,7 @@ use clap::Parser;
 use deadpool::managed::TimeoutType;
 use deadpool_postgres::{Manager, Pool, PoolError, Runtime, Timeouts};
 use futures::StreamExt;
+use janus_aggregator_api::git_revision;
 use janus_aggregator_core::datastore::{Crypter, Datastore};
 use janus_core::time::Clock;
 use opentelemetry::metrics::{Meter, MetricsError};
@@ -72,7 +72,7 @@ pub async fn database_pool(db_config: &DbConfig, db_password: Option<&str>) -> R
         database_config.password(pass);
     }
 
-    let connection_pool_timeout = Duration::from_secs(db_config.connection_pool_timeouts_secs);
+    let connection_pool_timeout = Duration::from_secs(db_config.connection_pool_timeouts_s);
 
     let conn_mgr = if let Some(ref path) = db_config.tls_trust_store_path {
         let root_store = load_pem_trust_store(path).context("failed to load TLS trust store")?;
@@ -247,6 +247,7 @@ pub struct BinaryContext<C: Clock, Options: BinaryOptions, Config: BinaryConfig>
 }
 
 pub fn janus_main<C, Options, Config, F, Fut>(
+    service_name: &str,
     options: Options,
     clock: C,
     uses_rayon: bool,
@@ -309,7 +310,8 @@ where
             version = env!("CARGO_PKG_VERSION"),
             git_revision = git_revision(),
             rust_version = env!("RUSTC_SEMVER"),
-            "Starting up"
+            "Starting {}",
+            service_name,
         );
 
         // Connect to database.
@@ -560,6 +562,7 @@ mod tests {
             zpages_handler, CommonBinaryOptions,
         },
         config::DbConfig,
+        metrics::test_util::InMemoryMetricsInfrastructure,
     };
     use clap::CommandFactory;
     use janus_aggregator_core::datastore::test_util::ephemeral_datastore;
@@ -567,15 +570,9 @@ mod tests {
         install_test_trace_subscriber,
         testcontainers::{Postgres, Volume},
     };
-    use opentelemetry::metrics::MeterProvider as _;
-    use opentelemetry_sdk::{
-        metrics::{data::Gauge, PeriodicReader, SdkMeterProvider},
-        runtime::Tokio,
-        testing::metrics::InMemoryMetricsExporter,
-    };
-    use std::{collections::HashMap, fs};
-    use testcontainers::{core::Mount, runners::AsyncRunner, RunnableImage};
-    use tokio::task::spawn_blocking;
+    use opentelemetry_sdk::metrics::data::Gauge;
+    use std::fs;
+    use testcontainers::{core::Mount, runners::AsyncRunner, ContainerRequest, ImageExt};
     use tracing_subscriber::{reload, EnvFilter};
     use trillium::Status;
     use trillium_testing::prelude::*;
@@ -666,53 +663,52 @@ mod tests {
         // case those were lost on a non-POSIX host). Then, we run a second container with the volume
         // mounted in, and use the fixed files in the volume in database configuration.
         let volume = Volume::new();
-        let setup_image = RunnableImage::from((
-            Postgres::with_entrypoint("/bin/bash".to_string()),
-            Vec::from([
-                "-c".to_string(),
-                concat!(
-                    "cp /etc/ssl/postgresql_host/* /etc/ssl/postgresql/ && ",
-                    "chown postgres /etc/ssl/postgresql/* && ",
-                    "chmod 600 /etc/ssl/postgresql/127.0.0.1-key.pem && ",
-                    // This satisfies the ReadyCondition.
-                    "echo 'database system is ready to accept connections' >&2",
-                )
-                .to_string(),
-            ]),
-        ))
-        .with_mount(Mount::bind_mount(
-            fs::canonicalize("tests/tls_files")
-                .unwrap()
-                .into_os_string()
-                .into_string()
-                .unwrap(),
-            "/etc/ssl/postgresql_host",
-        ))
-        .with_mount(Mount::volume_mount(volume.name(), "/etc/ssl/postgresql"));
+        let setup_image =
+            ContainerRequest::from(Postgres::with_entrypoint("/bin/bash".to_string()))
+                .with_cmd([
+                    "-c",
+                    concat!(
+                        "cp /etc/ssl/postgresql_host/* /etc/ssl/postgresql/ && ",
+                        "chown postgres /etc/ssl/postgresql/* && ",
+                        "chmod 600 /etc/ssl/postgresql/127.0.0.1-key.pem && ",
+                        // This satisfies the ReadyCondition.
+                        "echo 'database system is ready to accept connections' >&2",
+                    ),
+                ])
+                .with_mount(Mount::bind_mount(
+                    fs::canonicalize("tests/tls_files")
+                        .unwrap()
+                        .into_os_string()
+                        .into_string()
+                        .unwrap(),
+                    "/etc/ssl/postgresql_host",
+                ))
+                .with_mount(Mount::volume_mount(volume.name(), "/etc/ssl/postgresql"));
         let setup_container = setup_image.start().await;
         drop(setup_container);
 
-        let image = RunnableImage::from((
-            Postgres::default(),
-            Vec::from([
-                "-c".to_string(),
-                "ssl=on".to_string(),
-                "-c".to_string(),
-                "ssl_cert_file=/etc/ssl/postgresql/127.0.0.1.pem".to_string(),
-                "-c".to_string(),
-                "ssl_key_file=/etc/ssl/postgresql/127.0.0.1-key.pem".to_string(),
-            ]),
-        ))
-        .with_mount(Mount::volume_mount(volume.name(), "/etc/ssl/postgresql"));
-        let db_container = image.start().await;
+        let image = ContainerRequest::from(Postgres::default())
+            .with_cmd([
+                "-c",
+                "ssl=on",
+                "-c",
+                "ssl_cert_file=/etc/ssl/postgresql/127.0.0.1.pem",
+                "-c",
+                "ssl_key_file=/etc/ssl/postgresql/127.0.0.1-key.pem",
+            ])
+            .with_mount(Mount::volume_mount(volume.name(), "/etc/ssl/postgresql"));
+        let db_container = image.start().await.unwrap();
         const POSTGRES_DEFAULT_PORT: u16 = 5432;
-        let port = db_container.get_host_port_ipv4(POSTGRES_DEFAULT_PORT).await;
+        let port = db_container
+            .get_host_port_ipv4(POSTGRES_DEFAULT_PORT)
+            .await
+            .unwrap();
 
         let db_config = DbConfig {
             url: format!("postgres://postgres@127.0.0.1:{port}/postgres?sslmode=require")
                 .parse()
                 .unwrap(),
-            connection_pool_timeouts_secs: 5,
+            connection_pool_timeouts_s: 5,
             connection_pool_max_size: None,
             check_schema_version: false,
             tls_trust_store_path: Some("tests/tls_files/rootCA.pem".into()),
@@ -729,57 +725,30 @@ mod tests {
         let ephemeral_datastore = ephemeral_datastore().await;
         let pool = ephemeral_datastore.pool();
 
-        let exporter = InMemoryMetricsExporter::default();
-        let reader = PeriodicReader::builder(exporter.clone(), Tokio).build();
-        let meter_provider = SdkMeterProvider::builder()
-            .with_reader(reader.clone())
-            .build();
-        let meter = meter_provider.meter("tests");
+        let in_memory_metrics = InMemoryMetricsInfrastructure::new();
 
-        register_database_pool_status_metrics(pool.clone(), &meter).unwrap();
+        register_database_pool_status_metrics(pool.clone(), &in_memory_metrics.meter).unwrap();
 
-        check_database_pool_gauges(&meter_provider, &exporter, 0, 0, 0).await;
+        check_database_pool_gauges(&in_memory_metrics, 0, 0, 0).await;
         let connection = pool.get().await.unwrap();
-        check_database_pool_gauges(&meter_provider, &exporter, 0, 1, 0).await;
+        check_database_pool_gauges(&in_memory_metrics, 0, 1, 0).await;
         drop(connection);
-        check_database_pool_gauges(&meter_provider, &exporter, 1, 1, 0).await;
+        check_database_pool_gauges(&in_memory_metrics, 1, 1, 0).await;
 
-        spawn_blocking(move || {
-            // TODO: PeriodicReader::shutdown() currently has a bug that results in this method
-            // always returning an error. Ignore this until the fix makes it into the next release.
-            // See https://github.com/open-telemetry/opentelemetry-rust/pull/1375.
-            let _ = meter_provider.shutdown();
-        })
-        .await
-        .unwrap();
+        in_memory_metrics.shutdown().await;
     }
 
     async fn check_database_pool_gauges(
-        meter_provider: &SdkMeterProvider,
-        exporter: &InMemoryMetricsExporter,
+        in_memory_metrics: &InMemoryMetricsInfrastructure,
         expected_available: u64,
         expected_total: u64,
         expected_waiting: u64,
     ) {
-        spawn_blocking({
-            let meter_provider = meter_provider.clone();
-            move || {
-                meter_provider.force_flush().unwrap();
-            }
-        })
-        .await
-        .unwrap();
-
-        let finished_metrics = exporter.get_finished_metrics().unwrap();
-        let metrics = finished_metrics
-            .into_iter()
-            .flat_map(|rm| rm.scope_metrics.into_iter())
-            .flat_map(|sm| sm.metrics.into_iter())
-            .map(|metric| (metric.name.into_owned(), metric.data))
-            .collect::<HashMap<_, _>>();
+        let metrics = in_memory_metrics.collect().await;
 
         assert_eq!(
             metrics["janus_database_pool_available_connections"]
+                .data
                 .as_any()
                 .downcast_ref::<Gauge<u64>>()
                 .unwrap()
@@ -789,6 +758,7 @@ mod tests {
         );
         assert_eq!(
             metrics["janus_database_pool_total_connections"]
+                .data
                 .as_any()
                 .downcast_ref::<Gauge<u64>>()
                 .unwrap()
@@ -798,6 +768,7 @@ mod tests {
         );
         assert_eq!(
             metrics["janus_database_pool_waiting_tasks"]
+                .data
                 .as_any()
                 .downcast_ref::<Gauge<u64>>()
                 .unwrap()

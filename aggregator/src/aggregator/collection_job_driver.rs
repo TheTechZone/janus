@@ -18,13 +18,17 @@ use janus_aggregator_core::{
     },
     task,
 };
-use janus_core::{retries::is_retryable_http_status, time::Clock, vdaf_dispatch};
+use janus_core::{
+    retries::{is_retryable_http_client_error, is_retryable_http_status},
+    time::Clock,
+    vdaf_dispatch,
+};
 use janus_messages::{
     query_type::{FixedSize, QueryType, TimeInterval},
     AggregateShare, AggregateShareReq, BatchSelector,
 };
 use opentelemetry::{
-    metrics::{Counter, Histogram, Meter, Unit},
+    metrics::{Counter, Histogram, Meter},
     KeyValue, Value,
 };
 use prio::{
@@ -631,6 +635,7 @@ where
             Error::Http(http_error_response) => {
                 is_retryable_http_status(http_error_response.status())
             }
+            Error::HttpClient(error) => is_retryable_http_client_error(error),
             Error::Datastore(error) => match error {
                 datastore::Error::Db(_) | datastore::Error::Pool(_) => true,
                 datastore::Error::User(error) => match error.downcast_ref::<Error>() {
@@ -660,7 +665,7 @@ impl CollectionJobDriverMetrics {
         let jobs_finished_counter = meter
             .u64_counter("janus_collection_jobs_finished")
             .with_description("Count of finished collection jobs.")
-            .with_unit(Unit::new("{job}"))
+            .with_unit("{job}")
             .init();
         jobs_finished_counter.add(0, &[]);
 
@@ -669,13 +674,13 @@ impl CollectionJobDriverMetrics {
             .with_description(
                 "The amount of time elapsed while making an HTTP request to a helper.",
             )
-            .with_unit(Unit::new("s"))
+            .with_unit("s")
             .init();
 
         let jobs_abandoned_counter = meter
             .u64_counter("janus_collection_jobs_abandoned")
             .with_description("Count of abandoned collection jobs.")
-            .with_unit(Unit::new("{job}"))
+            .with_unit("{job}")
             .init();
         jobs_abandoned_counter.add(0, &[]);
 
@@ -685,7 +690,7 @@ impl CollectionJobDriverMetrics {
                 "Count of collection jobs that were run to completion but found to have been \
                  deleted.",
             )
-            .with_unit(Unit::new("{job}"))
+            .with_unit("{job}")
             .init();
         deleted_jobs_encountered_counter.add(0, &[]);
 
@@ -695,14 +700,14 @@ impl CollectionJobDriverMetrics {
                 "Count of collection jobs that were run to completion but found in an unexpected \
                  state.",
             )
-            .with_unit(Unit::new("{job}"))
+            .with_unit("{job}")
             .init();
         unexpected_job_state_counter.add(0, &[]);
 
         let job_steps_retried_counter = meter
             .u64_counter("janus_job_retries")
             .with_description("Count of retried job steps.")
-            .with_unit(Unit::new("{step}"))
+            .with_unit("{step}")
             .init();
         job_steps_retried_counter.add(0, &[]);
 

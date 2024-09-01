@@ -8,7 +8,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use janus_aggregator_core::{datastore::Datastore, instrumented};
 use janus_core::{
     auth_tokens::{AuthenticationToken, DAP_AUTH_HEADER},
-    http::{extract_bearer_token, HeadersExt as _},
+    http::extract_bearer_token,
     taskprov::TASKPROV_HEADER,
     time::Clock,
     Runtime,
@@ -20,7 +20,7 @@ use janus_messages::{
     HpkeConfigList, Report, TaskId,
 };
 use opentelemetry::{
-    metrics::{Counter, Meter, Unit},
+    metrics::{Counter, Meter},
     KeyValue,
 };
 use prio::codec::Encode;
@@ -30,7 +30,7 @@ use std::{borrow::Cow, time::Duration as StdDuration};
 use std::{io::Cursor, sync::Arc};
 use tracing::warn;
 use trillium::{Conn, Handler, KnownHeaderName, Status};
-use trillium_api::{api, State};
+use trillium_api::{api, State, TryFromConn};
 use trillium_caching_headers::{CacheControlDirective, CachingHeadersExt as _};
 use trillium_opentelemetry::metrics;
 use trillium_router::{Router, RouterConnExt};
@@ -44,7 +44,7 @@ struct ErrorCode(&'static str);
 
 async fn run_error_handler(error: &Error, mut conn: Conn) -> Conn {
     let error_code = error.error_code();
-    conn.set_state(ErrorCode(error_code));
+    conn.insert_state(ErrorCode(error_code));
     let conn = match error {
         Error::InvalidConfiguration(_) => conn.with_status(Status::InternalServerError),
         Error::MessageDecode(_) => {
@@ -153,7 +153,7 @@ async fn run_error_handler(error: &Error, mut conn: Conn) -> Conn {
             &ProblemDocument::new_dap(DapProblemType::InvalidTask).with_task_id(task_id),
         ),
         Error::DifferentialPrivacy(_) => conn.with_status(Status::InternalServerError),
-        Error::ClientDisconnected => conn,
+        Error::ClientDisconnected => conn.with_status(Status::BadRequest),
     };
 
     if matches!(conn.status(), Some(status) if status.is_server_error()) {
@@ -230,7 +230,7 @@ impl StatusCounter {
                 .with_description(
                     "Count of requests handled by the aggregator, by method, route, and response status.",
                 )
-                .with_unit(Unit::new("{request}"))
+                .with_unit("{request}")
                 .init(),
         )
     }
@@ -424,7 +424,7 @@ async fn hpke_config_cors_preflight(mut conn: Conn) -> Conn {
 /// API handler for the "/tasks/.../reports" PUT endpoint.
 async fn upload<C: Clock>(
     conn: &mut Conn,
-    (State(aggregator), body): (State<Arc<Aggregator<C>>>, Vec<u8>),
+    (State(aggregator), BodyBytes(body)): (State<Arc<Aggregator<C>>>, BodyBytes),
 ) -> Result<Status, ArcError> {
     validate_content_type(conn, Report::MEDIA_TYPE).map_err(Arc::new)?;
 
@@ -466,7 +466,7 @@ async fn upload_cors_preflight(mut conn: Conn) -> Conn {
 /// API handler for the "/tasks/.../aggregation_jobs/..." PUT endpoint.
 async fn aggregation_jobs_put<C: Clock>(
     conn: &mut Conn,
-    (State(aggregator), body): (State<Arc<Aggregator<C>>>, Vec<u8>),
+    (State(aggregator), BodyBytes(body)): (State<Arc<Aggregator<C>>>, BodyBytes),
 ) -> Result<EncodedBody<AggregationJobResp>, Error> {
     validate_content_type(
         conn,
@@ -494,7 +494,7 @@ async fn aggregation_jobs_put<C: Clock>(
 /// API handler for the "/tasks/.../aggregation_jobs/..." POST endpoint.
 async fn aggregation_jobs_post<C: Clock>(
     conn: &mut Conn,
-    (State(aggregator), body): (State<Arc<Aggregator<C>>>, Vec<u8>),
+    (State(aggregator), BodyBytes(body)): (State<Arc<Aggregator<C>>>, BodyBytes),
 ) -> Result<EncodedBody<AggregationJobResp>, Error> {
     validate_content_type(conn, AggregationJobContinueReq::MEDIA_TYPE)?;
 
@@ -540,7 +540,7 @@ async fn aggregation_jobs_delete<C: Clock>(
 /// API handler for the "/tasks/.../collection_jobs/..." PUT endpoint.
 async fn collection_jobs_put<C: Clock>(
     conn: &mut Conn,
-    (State(aggregator), body): (State<Arc<Aggregator<C>>>, Vec<u8>),
+    (State(aggregator), BodyBytes(body)): (State<Arc<Aggregator<C>>>, BodyBytes),
 ) -> Result<Status, Error> {
     validate_content_type(conn, CollectionReq::<TimeInterval>::MEDIA_TYPE)?;
 
@@ -610,7 +610,7 @@ async fn collection_jobs_delete<C: Clock>(
 /// API handler for the "/tasks/.../aggregate_shares" POST endpoint.
 async fn aggregate_shares<C: Clock>(
     conn: &mut Conn,
-    (State(aggregator), body): (State<Arc<Aggregator<C>>>, Vec<u8>),
+    (State(aggregator), BodyBytes(body)): (State<Arc<Aggregator<C>>>, BodyBytes),
 ) -> Result<EncodedBody<AggregateShare>, Error> {
     validate_content_type(conn, AggregateShareReq::<TimeInterval>::MEDIA_TYPE)?;
 
@@ -686,7 +686,7 @@ fn parse_auth_token(task_id: &TaskId, conn: &Conn) -> Result<Option<Authenticati
     }
 
     conn.request_headers()
-        .get_coalescing_duplicates(DAP_AUTH_HEADER) // TODO(#3163): get_coalescing_duplicates -> get
+        .get(DAP_AUTH_HEADER)
         .map(|value| {
             AuthenticationToken::new_dap_auth_token_from_bytes(value.as_ref())
                 .map_err(|e| Error::BadRequest(format!("bad DAP-Auth-Token header: {e}")))
@@ -733,6 +733,25 @@ fn parse_taskprov_header<C: Clock>(
     }
 }
 
+struct BodyBytes(Vec<u8>);
+
+#[async_trait]
+impl TryFromConn for BodyBytes {
+    type Error = Error;
+
+    async fn try_from_conn(conn: &mut Conn) -> Result<Self, Self::Error> {
+        conn.request_body()
+            .await
+            .read_bytes()
+            .await
+            .map(BodyBytes)
+            .map_err(|error| match error {
+                trillium::Error::Io(_) | trillium::Error::Closed => Error::ClientDisconnected,
+                _ => Error::BadRequest(error.to_string()),
+            })
+    }
+}
+
 #[cfg(feature = "test-util")]
 #[cfg_attr(docsrs, doc(cfg(feature = "test-util")))]
 pub mod test_util {
@@ -740,12 +759,14 @@ pub mod test_util {
     use crate::aggregator::test_util::default_aggregator_config;
     use janus_aggregator_core::{
         datastore::{
+            models::HpkeKeyState,
             test_util::{ephemeral_datastore, EphemeralDatastore},
             Datastore,
         },
         test_util::noop_meter,
     };
     use janus_core::{
+        hpke::HpkeKeypair,
         test_util::{install_test_trace_subscriber, runtime::TestRuntime},
         time::MockClock,
     };
@@ -773,29 +794,57 @@ pub mod test_util {
         serde_json::from_slice(&take_response_body(test_conn).await).unwrap()
     }
 
-    /// Returns structures necessary for completing an HTTP handler test. The returned
+    /// Contains structures necessary for completing an HTTP handler test. The contained
     /// [`EphemeralDatastore`] should be given a variable binding to prevent it being prematurely
     /// dropped.
-    pub async fn setup_http_handler_test() -> (
-        MockClock,
-        EphemeralDatastore,
-        Arc<Datastore<MockClock>>,
-        impl Handler,
-    ) {
-        install_test_trace_subscriber();
-        let clock = MockClock::default();
-        let ephemeral_datastore = ephemeral_datastore().await;
-        let datastore = Arc::new(ephemeral_datastore.datastore(clock.clone()).await);
-        let handler = aggregator_handler(
-            datastore.clone(),
-            clock.clone(),
-            TestRuntime::default(),
-            &noop_meter(),
-            default_aggregator_config(),
-        )
-        .await
-        .unwrap();
+    pub struct HttpHandlerTest {
+        pub clock: MockClock,
+        pub ephemeral_datastore: EphemeralDatastore,
+        pub datastore: Arc<Datastore<MockClock>>,
+        pub handler: Box<dyn Handler>,
+        pub hpke_keypair: HpkeKeypair,
+    }
 
-        (clock, ephemeral_datastore, datastore, handler)
+    impl HttpHandlerTest {
+        pub async fn new() -> Self {
+            install_test_trace_subscriber();
+            let clock = MockClock::default();
+            let ephemeral_datastore = ephemeral_datastore().await;
+            let datastore = Arc::new(ephemeral_datastore.datastore(clock.clone()).await);
+
+            let hpke_keypair = HpkeKeypair::test();
+            datastore
+                .run_unnamed_tx(|tx| {
+                    let hpke_keypair = hpke_keypair.clone();
+                    Box::pin(async move {
+                        tx.put_global_hpke_keypair(&hpke_keypair).await?;
+                        tx.set_global_hpke_keypair_state(
+                            hpke_keypair.config().id(),
+                            &HpkeKeyState::Active,
+                        )
+                        .await
+                    })
+                })
+                .await
+                .unwrap();
+
+            let handler = aggregator_handler(
+                datastore.clone(),
+                clock.clone(),
+                TestRuntime::default(),
+                &noop_meter(),
+                default_aggregator_config(),
+            )
+            .await
+            .unwrap();
+
+            Self {
+                clock,
+                ephemeral_datastore,
+                datastore,
+                handler: Box::new(handler),
+                hpke_keypair,
+            }
+        }
     }
 }

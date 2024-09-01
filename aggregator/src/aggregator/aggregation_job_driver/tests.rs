@@ -1,6 +1,8 @@
 use crate::{
     aggregator::{
-        aggregation_job_driver::AggregationJobDriver, test_util::BATCH_AGGREGATION_SHARD_COUNT,
+        aggregation_job_driver::AggregationJobDriver,
+        test_util::assert_task_aggregation_counter,
+        test_util::{BATCH_AGGREGATION_SHARD_COUNT, TASK_AGGREGATION_COUNTER_SHARD_COUNT},
         Error,
     },
     binary_utils::job_driver::JobDriver,
@@ -13,7 +15,7 @@ use janus_aggregator_core::{
         models::{
             merge_batch_aggregations_by_batch, AcquiredAggregationJob, AggregationJob,
             AggregationJobState, BatchAggregation, BatchAggregationState, LeaderStoredReport,
-            Lease, ReportAggregation, ReportAggregationState,
+            Lease, ReportAggregation, ReportAggregationState, TaskAggregationCounter,
         },
         test_util::{ephemeral_datastore, EphemeralDatastore},
         Datastore,
@@ -23,7 +25,7 @@ use janus_aggregator_core::{
     test_util::noop_meter,
 };
 use janus_core::{
-    hpke::test_util::generate_test_hpke_config_and_private_key,
+    hpke::HpkeKeypair,
     report_id::ReportIdChecksumExt,
     retries::test_util::LimitedRetryer,
     test_util::{install_test_trace_subscriber, run_vdaf, runtime::TestRuntimeManager},
@@ -52,6 +54,7 @@ use prio::{
 };
 use rand::random;
 use std::{sync::Arc, time::Duration as StdDuration};
+use tokio::time::timeout;
 use trillium_tokio::Stopper;
 
 #[tokio::test]
@@ -97,7 +100,7 @@ async fn aggregation_job_driver() {
     );
 
     let agg_auth_token = task.aggregator_auth_token().clone();
-    let helper_hpke_keypair = generate_test_hpke_config_and_private_key();
+    let helper_hpke_keypair = HpkeKeypair::test();
     let report = LeaderStoredReport::generate(
         *task.id(),
         report_metadata,
@@ -224,6 +227,7 @@ async fn aggregation_job_driver() {
         LimitedRetryer::new(0),
         &noop_meter(),
         BATCH_AGGREGATION_SHARD_COUNT,
+        TASK_AGGREGATION_COUNTER_SHARD_COUNT,
     ));
     let stopper = Stopper::new();
 
@@ -252,7 +256,12 @@ async fn aggregation_job_driver() {
 
     tracing::info!("awaiting stepper tasks");
     // Wait for all of the aggregation job stepper tasks to complete.
-    runtime_manager.wait_for_completed_tasks("stepper", 2).await;
+    timeout(
+        StdDuration::from_secs(30),
+        runtime_manager.wait_for_completed_tasks("stepper", 2),
+    )
+    .await
+    .unwrap();
     // Stop the aggregation job driver.
     stopper.stop();
     // Wait for the aggregation job driver task to complete.
@@ -340,6 +349,9 @@ async fn aggregation_job_driver() {
     assert_eq!(want_aggregation_job, got_aggregation_job);
     assert_eq!(want_report_aggregation, got_report_aggregation);
     assert_eq!(want_batch_aggregations, got_batch_aggregations);
+
+    assert_task_aggregation_counter(&ds, *task.id(), TaskAggregationCounter::new_with_values(1))
+        .await;
 }
 
 #[tokio::test]
@@ -375,7 +387,7 @@ async fn step_time_interval_aggregation_job_init_single_step() {
     );
 
     let agg_auth_token = task.aggregator_auth_token();
-    let helper_hpke_keypair = generate_test_hpke_config_and_private_key();
+    let helper_hpke_keypair = HpkeKeypair::test();
     let report = LeaderStoredReport::generate(
         *task.id(),
         report_metadata,
@@ -538,6 +550,7 @@ async fn step_time_interval_aggregation_job_init_single_step() {
         LimitedRetryer::new(1),
         &noop_meter(),
         BATCH_AGGREGATION_SHARD_COUNT,
+        TASK_AGGREGATION_COUNTER_SHARD_COUNT,
     );
     aggregation_job_driver
         .step_aggregation_job(ds.clone(), Arc::new(lease))
@@ -665,6 +678,9 @@ async fn step_time_interval_aggregation_job_init_single_step() {
         got_repeated_extension_report_aggregation
     );
     assert_eq!(want_batch_aggregations, got_batch_aggregations);
+
+    assert_task_aggregation_counter(&ds, *task.id(), TaskAggregationCounter::new_with_values(1))
+        .await;
 }
 
 #[tokio::test]
@@ -704,7 +720,7 @@ async fn step_time_interval_aggregation_job_init_two_steps() {
     );
 
     let agg_auth_token = task.aggregator_auth_token();
-    let helper_hpke_keypair = generate_test_hpke_config_and_private_key();
+    let helper_hpke_keypair = HpkeKeypair::test();
     let report = LeaderStoredReport::generate(
         *task.id(),
         report_metadata,
@@ -832,6 +848,7 @@ async fn step_time_interval_aggregation_job_init_two_steps() {
         LimitedRetryer::new(0),
         &noop_meter(),
         BATCH_AGGREGATION_SHARD_COUNT,
+        TASK_AGGREGATION_COUNTER_SHARD_COUNT,
     );
     aggregation_job_driver
         .step_aggregation_job(ds.clone(), Arc::new(lease))
@@ -921,6 +938,9 @@ async fn step_time_interval_aggregation_job_init_two_steps() {
     assert_eq!(want_aggregation_job, got_aggregation_job);
     assert_eq!(want_report_aggregation, got_report_aggregation);
     assert_eq!(want_batch_aggregations, got_batch_aggregations);
+
+    assert_task_aggregation_counter(&ds, *task.id(), TaskAggregationCounter::new_with_values(0))
+        .await;
 }
 
 #[tokio::test]
@@ -983,7 +1003,7 @@ async fn step_time_interval_aggregation_job_init_partially_garbage_collected() {
     );
 
     let agg_auth_token = task.aggregator_auth_token();
-    let helper_hpke_keypair = generate_test_hpke_config_and_private_key();
+    let helper_hpke_keypair = HpkeKeypair::test();
     let gc_eligible_report = LeaderStoredReport::generate(
         *task.id(),
         gc_eligible_report_metadata,
@@ -1181,6 +1201,7 @@ async fn step_time_interval_aggregation_job_init_partially_garbage_collected() {
         LimitedRetryer::new(0),
         &noop_meter(),
         BATCH_AGGREGATION_SHARD_COUNT,
+        TASK_AGGREGATION_COUNTER_SHARD_COUNT,
     );
     aggregation_job_driver
         .step_aggregation_job(ds.clone(), Arc::new(lease))
@@ -1283,6 +1304,9 @@ async fn step_time_interval_aggregation_job_init_partially_garbage_collected() {
     assert_eq!(want_aggregation_job, got_aggregation_job);
     assert_eq!(want_report_aggregations, got_report_aggregations);
     assert_eq!(want_batch_aggregations, got_batch_aggregations);
+
+    assert_task_aggregation_counter(&ds, *task.id(), TaskAggregationCounter::new_with_values(2))
+        .await;
 }
 
 #[tokio::test]
@@ -1325,7 +1349,7 @@ async fn step_fixed_size_aggregation_job_init_single_step() {
     );
 
     let agg_auth_token = task.aggregator_auth_token();
-    let helper_hpke_keypair = generate_test_hpke_config_and_private_key();
+    let helper_hpke_keypair = HpkeKeypair::test();
     let report = LeaderStoredReport::generate(
         *task.id(),
         report_metadata,
@@ -1460,6 +1484,7 @@ async fn step_fixed_size_aggregation_job_init_single_step() {
         LimitedRetryer::new(0),
         &noop_meter(),
         BATCH_AGGREGATION_SHARD_COUNT,
+        TASK_AGGREGATION_COUNTER_SHARD_COUNT,
     );
     let error = aggregation_job_driver
         .step_aggregation_job(ds.clone(), Arc::new(lease.clone()))
@@ -1562,6 +1587,9 @@ async fn step_fixed_size_aggregation_job_init_single_step() {
     assert_eq!(want_aggregation_job, got_aggregation_job);
     assert_eq!(want_report_aggregation, got_report_aggregation);
     assert_eq!(want_batch_aggregations, got_batch_aggregations);
+
+    assert_task_aggregation_counter(&ds, *task.id(), TaskAggregationCounter::new_with_values(1))
+        .await;
 }
 
 #[tokio::test]
@@ -1608,7 +1636,7 @@ async fn step_fixed_size_aggregation_job_init_two_steps() {
     );
 
     let agg_auth_token = task.aggregator_auth_token();
-    let helper_hpke_keypair = generate_test_hpke_config_and_private_key();
+    let helper_hpke_keypair = HpkeKeypair::test();
     let report = LeaderStoredReport::generate(
         *task.id(),
         report_metadata,
@@ -1737,6 +1765,7 @@ async fn step_fixed_size_aggregation_job_init_two_steps() {
         LimitedRetryer::new(0),
         &noop_meter(),
         BATCH_AGGREGATION_SHARD_COUNT,
+        TASK_AGGREGATION_COUNTER_SHARD_COUNT,
     );
     aggregation_job_driver
         .step_aggregation_job(ds.clone(), Arc::new(lease))
@@ -1826,6 +1855,9 @@ async fn step_fixed_size_aggregation_job_init_two_steps() {
     assert_eq!(want_aggregation_job, got_aggregation_job);
     assert_eq!(want_report_aggregation, got_report_aggregation);
     assert_eq!(want_batch_aggregations, got_batch_aggregations);
+
+    assert_task_aggregation_counter(&ds, *task.id(), TaskAggregationCounter::new_with_values(0))
+        .await;
 }
 
 #[tokio::test]
@@ -1872,7 +1904,7 @@ async fn step_time_interval_aggregation_job_continue() {
     );
 
     let agg_auth_token = task.aggregator_auth_token();
-    let helper_hpke_keypair = generate_test_hpke_config_and_private_key();
+    let helper_hpke_keypair = HpkeKeypair::test();
     let report = LeaderStoredReport::generate(
         *task.id(),
         report_metadata,
@@ -2042,6 +2074,7 @@ async fn step_time_interval_aggregation_job_continue() {
         LimitedRetryer::new(0),
         &noop_meter(),
         BATCH_AGGREGATION_SHARD_COUNT,
+        TASK_AGGREGATION_COUNTER_SHARD_COUNT,
     );
     let error = aggregation_job_driver
         .step_aggregation_job(ds.clone(), Arc::new(lease.clone()))
@@ -2162,6 +2195,9 @@ async fn step_time_interval_aggregation_job_continue() {
     assert_eq!(want_aggregation_job, got_aggregation_job);
     assert_eq!(want_report_aggregation, got_report_aggregation);
     assert_eq!(want_batch_aggregations, got_batch_aggregations);
+
+    assert_task_aggregation_counter(&ds, *task.id(), TaskAggregationCounter::new_with_values(1))
+        .await;
 }
 
 #[tokio::test]
@@ -2207,7 +2243,7 @@ async fn step_fixed_size_aggregation_job_continue() {
     );
 
     let agg_auth_token = task.aggregator_auth_token();
-    let helper_hpke_keypair = generate_test_hpke_config_and_private_key();
+    let helper_hpke_keypair = HpkeKeypair::test();
     let report = LeaderStoredReport::generate(
         *task.id(),
         report_metadata,
@@ -2358,6 +2394,7 @@ async fn step_fixed_size_aggregation_job_continue() {
         LimitedRetryer::new(1),
         &noop_meter(),
         BATCH_AGGREGATION_SHARD_COUNT,
+        TASK_AGGREGATION_COUNTER_SHARD_COUNT,
     );
     aggregation_job_driver
         .step_aggregation_job(ds.clone(), Arc::new(lease))
@@ -2457,6 +2494,9 @@ async fn step_fixed_size_aggregation_job_continue() {
     assert_eq!(want_aggregation_job, got_aggregation_job);
     assert_eq!(want_report_aggregation, got_report_aggregation);
     assert_eq!(want_batch_aggregations, got_batch_aggregations);
+
+    assert_task_aggregation_counter(&ds, *task.id(), TaskAggregationCounter::new_with_values(1))
+        .await;
 }
 
 struct CancelAggregationJobTestCase {
@@ -2501,7 +2541,7 @@ async fn setup_cancel_aggregation_job_test() -> CancelAggregationJobTestCase {
         &false,
     );
 
-    let helper_hpke_keypair = generate_test_hpke_config_and_private_key();
+    let helper_hpke_keypair = HpkeKeypair::test();
     let report = LeaderStoredReport::generate(
         *task.id(),
         report_metadata,
@@ -2614,6 +2654,7 @@ async fn cancel_aggregation_job() {
         LimitedRetryer::new(0),
         &noop_meter(),
         BATCH_AGGREGATION_SHARD_COUNT,
+        TASK_AGGREGATION_COUNTER_SHARD_COUNT,
     );
     aggregation_job_driver
         .abandon_aggregation_job(Arc::clone(&test_case.datastore), Arc::new(test_case.lease))
@@ -2722,6 +2763,7 @@ async fn cancel_aggregation_job_helper_aggregation_job_deletion_fails() {
         LimitedRetryer::new(0),
         &noop_meter(),
         BATCH_AGGREGATION_SHARD_COUNT,
+        TASK_AGGREGATION_COUNTER_SHARD_COUNT,
     );
     aggregation_job_driver
         .abandon_aggregation_job(Arc::clone(&test_case.datastore), Arc::new(test_case.lease))
@@ -2750,7 +2792,7 @@ async fn abandon_failing_aggregation_job_with_retryable_error() {
     let aggregation_job_id = random();
     let verify_key: VerifyKey<VERIFY_KEY_LENGTH> = task.vdaf_verify_key().unwrap();
 
-    let helper_hpke_keypair = generate_test_hpke_config_and_private_key();
+    let helper_hpke_keypair = HpkeKeypair::test();
 
     let vdaf = Prio3::new_count(2).unwrap();
     let time = clock
@@ -2840,6 +2882,7 @@ async fn abandon_failing_aggregation_job_with_retryable_error() {
         LimitedRetryer::new(0),
         &noop_meter(),
         BATCH_AGGREGATION_SHARD_COUNT,
+        TASK_AGGREGATION_COUNTER_SHARD_COUNT,
     ));
     let job_driver = Arc::new(
         JobDriver::new(
@@ -2991,7 +3034,7 @@ async fn abandon_failing_aggregation_job_with_fatal_error() {
     let aggregation_job_id = random();
     let verify_key: VerifyKey<VERIFY_KEY_LENGTH> = task.vdaf_verify_key().unwrap();
 
-    let helper_hpke_keypair = generate_test_hpke_config_and_private_key();
+    let helper_hpke_keypair = HpkeKeypair::test();
 
     let vdaf = Prio3::new_count(2).unwrap();
     let time = clock
@@ -3081,6 +3124,7 @@ async fn abandon_failing_aggregation_job_with_fatal_error() {
         LimitedRetryer::new(0),
         &noop_meter(),
         BATCH_AGGREGATION_SHARD_COUNT,
+        TASK_AGGREGATION_COUNTER_SHARD_COUNT,
     ));
     let job_driver = Arc::new(
         JobDriver::new(

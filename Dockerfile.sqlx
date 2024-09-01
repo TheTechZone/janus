@@ -1,4 +1,4 @@
-FROM rust:1.78.0-alpine as builder
+FROM rust:1.80.1-alpine AS builder
 ENV CARGO_INCREMENTAL=0
 ARG SQLX_VERSION
 RUN apk add libc-dev
@@ -6,11 +6,11 @@ RUN cargo install sqlx-cli \
     --version ${SQLX_VERSION} \
     --no-default-features --features rustls,postgres
 
-FROM alpine:3.19.1
+FROM alpine:3.20.2
 ARG SQLX_VERSION=unknown
 ARG GIT_REVISION=unknown
-LABEL revision ${GIT_REVISION}
-LABEL sqlx_version ${SQLX_VERSION}
+LABEL revision=${GIT_REVISION}
+LABEL sqlx_version=${SQLX_VERSION}
 COPY --from=builder /usr/local/cargo/bin/sqlx /sqlx
 COPY db /migrations
 ENTRYPOINT ["/sqlx"]
