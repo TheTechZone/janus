@@ -9,7 +9,7 @@ services:
       dockerfile: ../Dockerfile.postgress
     environment:
       POSTGRESQL_PORT_NUMBER: 5432
-      POSTGRES_HOST_AUTH_METHOD: trust
+      POSTGRES_HOST_AUTH_METHOD: trust # obviosuly unsafe for a real deployment but connection fails otherwise (okay for now)
     volumes:
       - type: bind
         source: 00_run-sqlx.sh
@@ -145,7 +145,7 @@ services:
       dockerfile: ../Dockerfile.postgress
     environment:
       POSTGRESQL_PORT_NUMBER: 5432
-      POSTGRES_HOST_AUTH_METHOD: trust
+      POSTGRES_HOST_AUTH_METHOD: trust # obviosuly unsafe for a real deployment but connection fails otherwise (okay for now)
     volumes:
       - type: bind
         source: 00_run-sqlx.sh

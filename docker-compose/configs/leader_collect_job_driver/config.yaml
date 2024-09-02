@@ -6,9 +6,8 @@ logging_config:
   force_json_output: true
 
 # Maximum interval on which to acquire incomplete collection jobs. (required)
-job_discovery_interval_secs: 10
+job_discovery_interval_s: 10
 
-max_job_discovery_delay_secs: 10
 # Duration of leases of collection jobs being processed. (required)
 worker_lease_duration_secs: 600
 # Maximum allowable clock skew used when identifying expired leases on
